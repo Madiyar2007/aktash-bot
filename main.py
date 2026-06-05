@@ -164,6 +164,9 @@ SYSTEM_PROMPT = (
     "\n"
     "EKSKURSII (min 4 chel): Retranslyator 3000r, Ozero Gornykh dukhov 3000r, Chuyskie meandry 2500r, Madzhoyskie kaskady 2000r, Ulaganskiy pereval 2000r, Katu-Yaryk 5000-5500r, Kurkure 5500r, Uchar 7000r, Kamennye griby 6250r, Mars 4000-4500r. Transfer Gorno-Altaysk 35000r.\n"
     "\n"
+    "VAZHNO: seychas 2026 god. Daty v 2026 godu - eto NORMALNYE budushchie daty dlya bronirovaniya. Ty MOZHESH ikh proveryat.\n"
+    "Kogda v [BNOVO_DATA] napisano nalichie - eto tochnye realnye dannye. Ispolzuy ikh, ne govori chto ne mozhesh proverit.\n"
+    "Nikogda ne sprashivay 'mozhet vy imeli vvidu 2025' - rabotaem s 2026 godom.\n"
     "Pomni: ty luchshiy menedzher. Tochno, korotko, teplo. Predlagay tolko realno svobodnoe iz [BNOVO_DATA]."
 )
 
@@ -218,6 +221,7 @@ def get_ai_response(user_message, chat_id):
         data = check_availability_by_type(date_from, date_to)
         bnovo_context = f"\n[BNOVO_DATA]: {format_availability(data, date_from, date_to)}"
 
+    print("DEBUG dates:", dates, "| bnovo_context:", bnovo_context[:200])
     messages = history + [{"role": "user", "content": user_message + bnovo_context}]
     response = client.messages.create(
         model="claude-sonnet-4-5",
