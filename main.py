@@ -434,6 +434,15 @@ SYSTEM_PROMPT = """Ты — Асель, менеджер эко-отеля «А�
 - Цену и расчёт давай, когда известны даты и число гостей — иначе сначала уточни их.
 - Не выдавай по своей инициативе: список удобств, вместимость, доплаты, правила — только по запросу или когда это реально нужно для брони.
 
+ОДИН ВОПРОС ЗА РАЗ — СТРОГО:
+Никогда не задавай два вопроса в одном ответе. Ни через |||, ни в одном сообщении.
+Если нужно уточнить несколько вещей — спроси самое важное одно, жди ответа, потом следующее.
+НЕ спрашивай то, что уже знаешь из сообщения гостя:
+- Гость написал «21-25 июня» → ты уже знаешь даты И ночи (4). Не спрашивай «на сколько ночей?».
+- Гость написал «на двоих» → ты уже знаешь гостей. Не спрашивай «сколько человек?».
+- Гость написал состав семьи → ты уже знаешь гостей. Не спрашивай снова.
+Если в одном сообщении гость дал всё (даты + гостей) — сразу считай цену и давай ссылку, не уточняй.
+
 СТИЛЬ:
 - Короткие сообщения, разделяй через |||
 - Тёплая, приветливая, по-человечески. Без «Отлично!», «С удовольствием!», «Замечательно!».
@@ -666,7 +675,8 @@ def analyze_image(image_url):
 
 AVAIL_KW = ["свобод", "есть ли", "можно", "можете", "забронир", "брон", "заезд",
             "засел", "размест", "ноч", "чел", "человек", "мест", "приед",
-            "остановит", "номер", "дата", "числ"]
+            "остановит", "номер", "дата", "числ", "взросл", "детей", "ребён",
+            "ребенк", "семь", "собак", "нас двое", "нас трое", "нас четыр"]
 
 FOTO_KEYWORDS = ["фото", "покажи", "фотки", "посмотреть", "как выглядит", "покажите",
                  "фотографии", "скинь", "скиньте", "пришли", "прислать", "загляни", "посмотри"]
@@ -740,13 +750,13 @@ def _wazzup_msg_id(resp):
     except Exception:
         return None
 
-def send_wazzup_message(chat_id, channel_id, text):
+def send_wazzup_message(chat_id, channel_id, text, chat_type="whatsapp"):
     url = "https://api.wazzup24.com/v3/message"
     headers = {"Authorization": f"Bearer {WAZZUP_API_KEY}", "Content-Type": "application/json"}
-    payload = {"channelId": channel_id, "chatId": chat_id, "chatType": "whatsapp", "text": text}
+    payload = {"channelId": channel_id, "chatId": chat_id, "chatType": chat_type, "text": text}
     try:
-        r = requests.post(url, json=payload, headers=headers, timeout=15)  # FIX #7: timeout
-        mid = _wazzup_msg_id(r)  # запоминаем для reply
+        r = requests.post(url, json=payload, headers=headers, timeout=15)
+        mid = _wazzup_msg_id(r)
         if mid:
             remember_msg_text(mid, text)
         return r.status_code
@@ -754,14 +764,14 @@ def send_wazzup_message(chat_id, channel_id, text):
         sys.stderr.write(f"Wazzup send error: {e}\n"); sys.stderr.flush()
         return None
 
-def send_wazzup_photo(chat_id, channel_id, image_url, label=None):
+def send_wazzup_photo(chat_id, channel_id, image_url, label=None, chat_type="whatsapp"):
     url = "https://api.wazzup24.com/v3/message"
     headers = {"Authorization": f"Bearer {WAZZUP_API_KEY}", "Content-Type": "application/json"}
-    payload = {"channelId": channel_id, "chatId": chat_id, "chatType": "whatsapp", "contentUri": image_url}
+    payload = {"channelId": channel_id, "chatId": chat_id, "chatType": chat_type, "contentUri": image_url}
     try:
-        r = requests.post(url, json=payload, headers=headers, timeout=15)  # FIX #7: timeout
+        r = requests.post(url, json=payload, headers=headers, timeout=15)
         mid = _wazzup_msg_id(r)
-        if mid and label:  # reply на фото -> поймём, что гость про этот тип
+        if mid and label:
             remember_msg_text(mid, f"[фото: {label}]")
         sys.stderr.write(f"PHOTO: {r.status_code} {image_url[-30:]}\n"); sys.stderr.flush()
         return r.status_code
@@ -769,18 +779,18 @@ def send_wazzup_photo(chat_id, channel_id, image_url, label=None):
         sys.stderr.write(f"Wazzup photo error: {e}\n"); sys.stderr.flush()
         return None
 
-def send_room_photos(chat_id, channel_id, room_type):
+def send_room_photos(chat_id, channel_id, room_type, chat_type="whatsapp"):
     photos = ROOM_PHOTOS.get(room_type, [])
     label = ROOM_LABELS.get(room_type)
     for photo_url in photos:
         time.sleep(0.5)
-        send_wazzup_photo(chat_id, channel_id, photo_url, label=label)
+        send_wazzup_photo(chat_id, channel_id, photo_url, label=label, chat_type=chat_type)
 
-def send_wazzup_multi(chat_id, channel_id, full_text):
+def send_wazzup_multi(chat_id, channel_id, full_text, chat_type="whatsapp"):
     parts = [p.strip() for p in full_text.split("|||") if p.strip()]
     for part in parts:
         time.sleep(min(len(part) * 0.04, 2.5))
-        send_wazzup_message(chat_id, channel_id, part)
+        send_wazzup_message(chat_id, channel_id, part, chat_type)
         time.sleep(0.4)
     sys.stderr.write(f"Wazzup: отправлено {len(parts)} сообщений\n"); sys.stderr.flush()
 
@@ -812,11 +822,14 @@ def enqueue_message(msg):
     with _pending_lock:
         entry = _pending.get(chat_id)
         if entry is None:
-            entry = {"msgs": [], "channel_id": msg.get("channelId", ""), "timer": None}
+            entry = {"msgs": [], "channel_id": msg.get("channelId", ""),
+                     "chat_type": msg.get("chatType", "whatsapp"), "timer": None}
             _pending[chat_id] = entry
         entry["msgs"].append(msg)
         if msg.get("channelId"):
             entry["channel_id"] = msg.get("channelId")
+        if msg.get("chatType"):
+            entry["chat_type"] = msg.get("chatType")
         if entry["timer"]:
             entry["timer"].cancel()
         t = threading.Timer(DEBOUNCE_SECONDS, flush_chat, args=(chat_id,))
@@ -832,6 +845,7 @@ def flush_chat(chat_id):
         return
     msgs = entry["msgs"]
     channel_id = entry["channel_id"]
+    chat_type = entry.get("chat_type", "whatsapp")
     try:
         texts = []
         photo_descs = []
@@ -870,14 +884,14 @@ def flush_chat(chat_id):
         # Только голос и больше ничего
         if not combined and not photo_descs:
             if has_audio:
-                send_wazzup_multi(chat_id, channel_id, "Ой, голосовые пока не могу прослушать 🙏 ||| Напишите, пожалуйста, текстом — сразу помогу")
+                send_wazzup_multi(chat_id, channel_id, "Ой, голосовые пока не могу прослушать 🙏 ||| Напишите, пожалуйста, текстом — сразу помогу", chat_type)
             return
 
         # Тип номера: из текста, из цитаты, или с присланной карточки/фото
         room_type = detect_room_type(combined) or (detect_room_type(quoted_text) if quoted_text else None) or room_from_photo
         wants_photo = any(kw in combined.lower() for kw in FOTO_KEYWORDS)
         if room_type and wants_photo:
-            send_room_photos(chat_id, channel_id, room_type)
+            send_room_photos(chat_id, channel_id, room_type, chat_type)
             time.sleep(0.5)
 
         # Вход для модели: фото-описания + цитата + весь текст пачки
@@ -891,7 +905,7 @@ def flush_chat(chat_id):
         save_user = combined if combined else f"[фото: {'; '.join(photo_descs)[:100]}]"
         save_message(chat_id, "user", save_user)
         save_message(chat_id, "assistant", ai_reply)
-        send_wazzup_multi(chat_id, channel_id, ai_reply)
+        send_wazzup_multi(chat_id, channel_id, ai_reply, chat_type)
     except Exception as e:
         sys.stderr.write(f"flush_chat error: {e}\n"); sys.stderr.flush()
 
