@@ -4,6 +4,7 @@ import anthropic
 import os
 import sqlite3
 import time
+import re
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import urllib3
@@ -22,7 +23,6 @@ BNOVO_BASE_URL = 'https://api.pms.bnovo.ru'
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# Karta tipov nomerov Bnovo
 ROOM_TYPES = {
     428964: "Modul",
     428965: "Loft",
@@ -72,7 +72,6 @@ def get_bnovo_token():
     return None
 
 def check_availability_by_type(date_from, date_to):
-    """Vozvrashchaet skolko svobodno kazhdogo tipa na period"""
     token = get_bnovo_token()
     if not token:
         return None
@@ -91,8 +90,7 @@ def check_availability_by_type(date_from, date_to):
 
 def format_availability(data, date_from, date_to):
     if data is None:
-        return f"Ne udalos proverit nalichie na {date_from} - {date_to}."
-    
+        return f"Bnovo nedostupen, predlagay po baze znany."
     result = []
     for type_id_str, info in data.items():
         type_id = int(type_id_str)
@@ -100,128 +98,122 @@ def format_availability(data, date_from, date_to):
         full = info.get('full_quantity', 0)
         if full == 0:
             continue
-        # minimalnoe nalichie za ves period (chtoby vse nochi byli svobodny)
         avail_values = list(info.get('availability', {}).values())
-        if avail_values:
-            min_avail = min(avail_values)
-        else:
-            min_avail = 0
+        min_avail = min(avail_values) if avail_values else 0
         if min_avail > 0:
-            result.append(f"{name}: svobodno {min_avail}")
+            result.append(f"{name}: est")
         else:
-            result.append(f"{name}: net mest")
-    
+            result.append(f"{name}: zanyat")
     if not result:
         return f"Na {date_from} - {date_to} svobodnykh nomerov net."
-    return f"Nalichie na {date_from} - {date_to}: " + "; ".join(result)
+    return "Nalichie na " + date_from + " - " + date_to + ": " + "; ".join(result)
 
 SYSTEM_PROMPT = (
-    "Ty - Asel, menedzher ekotelya Aktash Villadzh na Altae. Ty luchshiy menedzher v mire.\n"
+    "Ty - Asel, menedzher ekotelya Aktash Villadzh na Altae.\n"
     "Ty zhivoy chelovek, ne bot. Obshchaysya na yazyke klienta.\n"
     "\n"
-    "PRINTSIPY LUCHSHEGO MENEDZHERA:\n"
-    "1. Otvechay TOCHNO na konkretnyy vopros. Ne vyvalivay vsyo podryad.\n"
-    "2. Davay rovno stolko skolko sprosili.\n"
-    "3. Vedi k broni estestvenno, myagko, bez davleniya.\n"
-    "4. Chuvstvuy kogda klient gotov - predlagay sleduyushchiy shag.\n"
-    "5. Teplyy no ne pritornyy. Bez 'Otlichno!', 'S udovolstviem!'.\n"
+    "=== TEKUSHCHIY GOD - 2026 ===\n"
+    "Seychas 2026 god. Eto tekushchiy god, ne budushchee.\n"
+    "Iyun 2026, iyul 2026, avgust 2026 - eto samye obychnye daty dlya bronirovaniya.\n"
+    "NIKOGDA ne govori 'ne mogu proverit nalichie na 2026 god' - eto absolyutno nepravilno.\n"
+    "NIKOGDA ne govori 'sboy sistemy' - prosto otvechay po [BNOVO_DATA].\n"
+    "NIKOGDA ne sprashivay 'vy imeli vvidu 2025' - my rabotaem s 2026 godom.\n"
     "\n"
-    "STIL: korotkie soobshcheniya cherez |||. Na prostoy vopros - 2-5 slov.\n"
-    "'Stoyanka est?' -> 'Da, na territorii'\n"
-    "Ne sprashivay 'chto eshche interesuet' posle kazhdogo otveta.\n"
-    "Emoji pochti net. Razmetki net (** ## spiski zapreshcheny).\n"
+    "=== DANNYE IZ BNOVO ===\n"
+    "Kogda v [BNOVO_DATA] napisano nalichie - eto REALNYE TOCHYNE DANNYE iz sistemy pryamo seychas.\n"
+    "Esli napisano 'est' - predlagay etot tip. Esli 'zanyat' - ne predlagay.\n"
+    "VSEGDA ispolzuy [BNOVO_DATA] dlya otveta o nalichii.\n"
     "\n"
-    "VAZHNO PRO NALICHIE:\n"
-    "Kogda v [BNOVO_DATA] est dannye o nalichii - eto REALNYE dannye iz sistemy pryamo seychas.\n"
-    "Predlagay TOLKO te tipy gde svobodno > 0. Esli 'net mest' - ne predlagay etot tip.\n"
-    "NIKOGDA ne nazyvay klientu tochnoe kolichestvo svobodnykh nomerov (ne govori 'svobodno 3 lofta').\n"
-    "Prosto predlagay tip esli on dostupen.\n"
+    "=== STIL OBSHCHENIYA ===\n"
+    "Korotkie soobshcheniya cherez |||. Bez shutok, bez igrivosti.\n"
+    "Bez 'Tогда быстро!', 'Ха, ладно', 'Otlichno!', 'Zamechatelno!'.\n"
+    "Teplo no delovito. Kak khoroshiy menedzher, ne kak drug.\n"
+    "Na prostoy vopros - korotkiy otvet 2-5 slov.\n"
+    "Emoji - maksimum odno za ves razgovor, luchshe bez nikh.\n"
+    "Razmetka zapreshchena: net **, ##, spiskov.\n"
     "\n"
-    "SBOR DANNYKH: po odnomu voprosu. Daty (chislo i mesyats), nochi, vzroslye, deti i vozrast, zhivotnye.\n"
-    "Esli tolko chislo bez mesyatsa - 'Na kakoy mesyats?'. Schitay tolko kogda znaesh vse.\n"
+    "=== PRINTSIPY ===\n"
+    "1. Otvechay TOCHNO na vopros - ne vyvalivay vsyo.\n"
+    "2. Odin vopros za raz - ne zadavay dva srazu.\n"
+    "3. Ne sprashivay 'tsena ili komfort' - sam predlozhi podkhodyashchee.\n"
+    "4. Ne perechislyay tipy nomerov - predlozhi 1-2 iz dostupnykh.\n"
+    "5. Vedi k broni myagko, bez davleniya.\n"
     "\n"
-    "NIKOGDA: ne dumyvay chego net, ne nazyvay kolichestvo nomerov, ne schitay bez vsekh dannykh, ne obeshchay skidki.\n"
+    "=== SBOR DANNYKH ===\n"
+    "Uznavay po odnomu: daty (chislo i mesyats), nochi, vzroslye, deti i vozrast, zhivotnye.\n"
+    "Esli tolko chislo bez mesyatsa - sprosi 'Na kakoy mesyats?'.\n"
+    "Schitay stoimost TOLKO kogda znaesh vse.\n"
     "\n"
-    "PODBOR: ne sprashivay 'tsena ili komfort'. Sam predlozhi 1-2 podhodyashchikh varianta iz dostupnykh.\n"
-    "Loft - ego plyusy: vyhod k rechke 5 shagov, vid na gory.\n"
-    "Kottedzh - ego plyusy: terrasa, vid na goru, rechka za domom.\n"
-    "Mozhesh kombinirovat nomera dlya bolshikh kompaniy.\n"
-    "\n"
-    "TIPY NOMEROV:\n"
-    "Nomer Standart: maks 4, 5000r za 2, svyshe +300r/chel, bez kholodilnika\n"
-    "Domik Standart: maks 4, 5500r za 2, svyshe +300r/chel\n"
-    "Kottedzh s terrasoy: 2 etazha otdelnye vhody, etazh maks 4, 6500r za 2, svyshe +300r, vid na goru, rechka za domom\n"
-    "Loft: 2 etazha otdelnye vhody, etazh maks 4, do 1 iyulya 7500r posle 7800r za 2, svyshe +300r, vyhod k rechke\n"
+    "=== TIPY NOMEROV ===\n"
+    "Nomer Standart: maks 4, 5000r/noch za 2, svyshe +300r/chel, bez kholodilnika\n"
+    "Domik Standart: maks 4, 5500r/noch za 2, svyshe +300r/chel\n"
+    "Kottedzh s terrasoy: 2 etazha otd vhody, etazh maks 4, 6500r/noch za 2, svyshe +300r, vid na goru, rechka za domom\n"
+    "Loft: 2 etazha otd vhody, etazh maks 4, do 1 iyulya 7500r posle 7800r za 2, svyshe +300r, vyhod k rechke\n"
     "Modul: maks 4, do 1 iyulya 7500r posle 7800r za 2, svyshe +300r, vyhod k rechke\n"
     "A-Frame: maks 6, do 1 iyulya 8000r posle 8500r za 2, svyshe +300r, samyy vmestitelnyy\n"
-    "Vezde: krovat-transformer + divan, tualet dush fen chaynik posuda WiFi kholodilnik (krome Nomer Standart). Deti do 5 let besplatno.\n"
+    "Везде: krovat-transformer divan, tualet dush fen chaynik posuda WiFi kholodilnik (krome Nomer Standart). Deti do 5 let besplatno.\n"
     "\n"
-    "USLUGI: Banya 1500r/chas min 2 chasa. Kafe 08:00-21:00. Besedki u rechki, mangaly, kostrovishche, detskaya ploshchadka, parking, WiFi. Zhivotnye 500r/den + pasport zdorovya.\n"
+    "NIKOGDA ne nazyvay kolichestvo svobodnykh nomerov klientu.\n"
+    "Predlagay tip esli v [BNOVO_DATA] napisano 'est'.\n"
     "\n"
-    "BRONIROVANIE: zaezd 14:00 vyezd 12:00, predoplata 50%. Otmena 7+ dney shtraf 10%, menshe - predoplata ne vozvrashchaetsya. Dlya broni: FIO, telefon, daty.\n"
+    "=== USLUGI ===\n"
+    "Banya 1500r/chas min 2ch. Kafe 08-21. Besedki u rechki, mangaly, parking, WiFi. Zhivotnye 500r/den + pasport.\n"
     "\n"
-    "MESTO: Respublika Altay, Ulaganskiy rayon, s. Aktash, ul. Lesnaya 1B. Pervaya liniya reki Chuya, gory vokrug.\n"
+    "=== BRONIROVANIE ===\n"
+    "Zaezd 14:00 vyezd 12:00. Predoplata 50%. Otmena 7+ dney shtraf 10%, menshe - predoplata ne vozvrashchaetsya.\n"
+    "Dlya broni: FIO, telefon, daty.\n"
     "\n"
-    "EKSKURSII (min 4 chel): Retranslyator 3000r, Ozero Gornykh dukhov 3000r, Chuyskie meandry 2500r, Madzhoyskie kaskady 2000r, Ulaganskiy pereval 2000r, Katu-Yaryk 5000-5500r, Kurkure 5500r, Uchar 7000r, Kamennye griby 6250r, Mars 4000-4500r. Transfer Gorno-Altaysk 35000r.\n"
+    "=== MESTO ===\n"
+    "Resp Altay, s Aktash, ul Lesnaya 1B. Pervaya liniya reki Chuya, gory vokrug.\n"
     "\n"
-    "VAZHNO: seychas 2026 god. Daty v 2026 godu - eto NORMALNYE budushchie daty dlya bronirovaniya. Ty MOZHESH ikh proveryat.\n"
-    "Kogda v [BNOVO_DATA] napisano nalichie - eto tochnye realnye dannye. Ispolzuy ikh, ne govori chto ne mozhesh proverit.\n"
-    "Nikogda ne sprashivay 'mozhet vy imeli vvidu 2025' - rabotaem s 2026 godom.\n"
-    "Pomni: ty luchshiy menedzher. Tochno, korotko, teplo. Predlagay tolko realno svobodnoe iz [BNOVO_DATA]."
+    "=== EKSKURSII (min 4 chel) ===\n"
+    "Retranslyator 3000r, Ozero Duhov 3000r, Meandry 2500r, Madzhoy 2000r, Ulaganskiy 2000r,\n"
+    "Katu-Yaryk 5000-5500r, Kurkure 5500r, Uchar 7000r, Griby 6250r, Mars 4000-4500r. Transfer GA 35000r.\n"
 )
-
 
 MONTHS = {
     'январ': '01', 'феврал': '02', 'март': '03', 'апрел': '04', 'мая': '05', 'май': '05',
     'июн': '06', 'июл': '07', 'август': '08', 'авг': '08', 'сентябр': '09', 'сент': '09',
-    'октябр': '10', 'окт': '10', 'ноябр': '11', 'декабр': '12', 'дек': '12'
+    'октябр': '10', 'окт': '10', 'ноябр': '11', 'декабр': '12'
 }
 
 def extract_dates(text):
-    import re
     text_low = text.lower()
     dates = []
-    # format DD.MM.YYYY
     for m in re.findall(r'(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{4})', text):
         dates.append(f"{m[2]}-{int(m[1]):02d}-{int(m[0]):02d}")
     if dates:
         return dates
-    # format "21 iyunya" / "21 iyun"
     for m in re.findall(r'(\d{1,2})\s*([а-я]+)', text_low):
         day = int(m[0])
         month_word = m[1]
         for key, num in MONTHS.items():
             if month_word.startswith(key):
-                year = 2026
-                dates.append(f"{year}-{num}-{day:02d}")
+                dates.append(f"2026-{num}-{day:02d}")
                 break
     return dates
-
 
 def get_ai_response(user_message, chat_id):
     history = get_history(chat_id)
 
     bnovo_context = ""
     dates = extract_dates(user_message)
-    # ishchem daty takzhe v istorii esli v tekushchem net
     if not dates:
         for h in reversed(history):
             if h['role'] == 'user':
-                dates = extract_dates(h['content'])
-                if dates:
+                found = extract_dates(h['content'])
+                if found:
+                    dates = found
                     break
 
     if dates:
         date_from = dates[0]
-        if len(dates) >= 2:
-            date_to = dates[1]
-        else:
-            # +3 dnya po umolchaniyu dlya proverki
-            date_to = (datetime.strptime(date_from, '%Y-%m-%d') + timedelta(days=3)).strftime('%Y-%m-%d')
+        date_to = (datetime.strptime(date_from, '%Y-%m-%d') + timedelta(days=3)).strftime('%Y-%m-%d') if len(dates) < 2 else dates[1]
         data = check_availability_by_type(date_from, date_to)
         bnovo_context = f"\n[BNOVO_DATA]: {format_availability(data, date_from, date_to)}"
 
-    print("DEBUG dates:", dates, "| bnovo_context:", bnovo_context[:200])
+    print(f"DEBUG dates={dates} | bnovo={bnovo_context[:150]}")
+
     messages = history + [{"role": "user", "content": user_message + bnovo_context}]
     response = client.messages.create(
         model="claude-sonnet-4-5",
@@ -239,7 +231,6 @@ def send_wazzup_message(chat_id, channel_id, text):
     r = requests.post(url, json=payload, headers=headers)
     return r.status_code
 
-
 def send_wazzup_multi(chat_id, channel_id, full_text):
     parts = [p.strip() for p in full_text.split("|||") if p.strip()]
     for part in parts:
@@ -248,13 +239,11 @@ def send_wazzup_multi(chat_id, channel_id, full_text):
         time.sleep(0.4)
     print("Wazzup: otpravleno", len(parts), "soobshcheniy")
 
-
 def send_max_message(chat_id, text):
     url = "https://botapi.max.ru/messages"
     params = {"access_token": MAX_TOKEN}
     payload = {"recipient": {"chat_id": chat_id}, "text": text}
     requests.post(url, params=params, json=payload)
-
 
 def send_max_multi(chat_id, full_text):
     parts = [p.strip() for p in full_text.split("|||") if p.strip()]
@@ -263,15 +252,15 @@ def send_max_multi(chat_id, full_text):
         send_max_message(chat_id, part)
         time.sleep(0.4)
 
-
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.json
     if not data:
         return "OK"
-
+    print(f"WEBHOOK: {str(data)[:300]}")
     if "messages" in data:
         for msg in data.get("messages", []):
+            print(f"MSG status={msg.get('status')} text={msg.get('text','')[:50]}")
             if msg.get("status") != "inbound":
                 continue
             text = msg.get("text", "")
@@ -283,7 +272,6 @@ def webhook():
             save_message(chat_id, "user", text)
             save_message(chat_id, "assistant", ai_reply)
             send_wazzup_multi(chat_id, channel_id, ai_reply)
-
     event_type = data.get("type")
     if event_type == "message_created":
         message = data.get("body", {})
@@ -294,14 +282,11 @@ def webhook():
             save_message(chat_id, "user", text)
             save_message(chat_id, "assistant", ai_reply)
             send_max_multi(chat_id, ai_reply)
-
     return "OK"
-
 
 @app.route("/", methods=["GET"])
 def index():
     return "Aktash Villadzh Bot rabotaet!"
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
