@@ -647,7 +647,13 @@ def analyze_image(image_url):
         response = client.messages.create(
             model="claude-sonnet-4-5",
             max_tokens=500,
-            system="Ты менеджер эко-отеля Акташ Вилладж. Клиент прислал фото. Определи что на фото: чек об оплате (извлеки сумму), паспорт (извлеки ФИО), или другое фото (опиши кратко). Отвечай коротко на русском.",
+            system=(
+                "Ты менеджер эко-отеля Акташ Вилладж. Гость прислал фото. Определи, что на нём, и ответь коротко на русском по одному из случаев:\n"
+                "1) Это карточка/скриншот номера с сайта или фото интерьера номера. Назови тип, если он виден на карточке или узнаётся: Лофт, Модуль, Коттедж с террасой, A-Frame, Номер Стандарт или Стандарт домик. Ответь строго в виде: 'НОМЕР: <тип>'. Если на карточке написано название — бери его. Если тип не определить — 'НОМЕР: неизвестно'.\n"
+                "2) Чек или скриншот об оплате — ответь 'ЧЕК: <сумма если видна>'.\n"
+                "3) Паспорт или документ — ответь 'ДОКУМЕНТ'.\n"
+                "4) Иначе — кратко опиши, что на фото."
+            ),
             messages=[{"role": "user", "content": [
                 {"type": "image", "source": {"type": "base64", "media_type": content_type, "data": image_data}},
                 {"type": "text", "text": "Что на этом фото?"}
@@ -661,6 +667,9 @@ def analyze_image(image_url):
 AVAIL_KW = ["свобод", "есть ли", "можно", "можете", "забронир", "брон", "заезд",
             "засел", "размест", "ноч", "чел", "человек", "мест", "приед",
             "остановит", "номер", "дата", "числ"]
+
+FOTO_KEYWORDS = ["фото", "покажи", "фотки", "посмотреть", "как выглядит", "покажите",
+                 "фотографии", "скинь", "скиньте", "пришли", "прислать", "загляни", "посмотри"]
 
 def get_ai_response(user_message, chat_id):
     history = get_history(chat_id)
@@ -791,68 +800,100 @@ def send_max_multi(chat_id, full_text):
         send_max_message(chat_id, part)
         time.sleep(0.4)
 
-def process_wazzup_message(msg):
-    """FIX #6: тяжёлая обработка одного сообщения (вызывается в фоновом потоке)."""
+DEBOUNCE_SECONDS = 6.0          # ждём, пока гость допишет серию сообщений
+_pending = {}                    # chat_id -> {"msgs":[...], "channel_id":..., "timer":Timer}
+_pending_lock = threading.Lock()
+
+def enqueue_message(msg):
+    """Кладём сообщение в буфер чата и (пере)заводим таймер. Ответим, когда гость замолчит."""
+    chat_id = msg.get("chatId", "")
+    if not chat_id:
+        return
+    with _pending_lock:
+        entry = _pending.get(chat_id)
+        if entry is None:
+            entry = {"msgs": [], "channel_id": msg.get("channelId", ""), "timer": None}
+            _pending[chat_id] = entry
+        entry["msgs"].append(msg)
+        if msg.get("channelId"):
+            entry["channel_id"] = msg.get("channelId")
+        if entry["timer"]:
+            entry["timer"].cancel()
+        t = threading.Timer(DEBOUNCE_SECONDS, flush_chat, args=(chat_id,))
+        t.daemon = True
+        entry["timer"] = t
+        t.start()
+
+def flush_chat(chat_id):
+    """Гость замолчал — обрабатываем всю накопленную пачку как одно обращение."""
+    with _pending_lock:
+        entry = _pending.pop(chat_id, None)
+    if not entry:
+        return
+    msgs = entry["msgs"]
+    channel_id = entry["channel_id"]
     try:
-        chat_id = msg.get("chatId", "")
-        channel_id = msg.get("channelId", "")
-        msg_type = msg.get("type", "text")
+        texts = []
+        photo_descs = []
+        room_from_photo = None
+        quoted_text = None
+        has_audio = False
+        for msg in msgs:
+            mt = msg.get("type", "text")
+            if mt in ("audio", "voice", "ptt"):
+                has_audio = True
+            elif mt in ("image", "photo"):
+                url = msg.get("fileUrl") or msg.get("url") or msg.get("imageUrl", "")
+                if url:
+                    desc = analyze_image(url)
+                    if desc:
+                        photo_descs.append(desc)
+                        rt = detect_room_type(desc)
+                        if rt:
+                            room_from_photo = rt
+                cap = msg.get("text") or msg.get("caption")
+                if cap:
+                    texts.append(cap)
+            elif mt in ("document", "file", "video", "sticker", "location", "contact"):
+                pass  # не пускаем в флоу брони, но и не отвечаем отдельно — обработаем вместе с текстом
+            elif mt == "text":
+                t = msg.get("text", "")
+                if t:
+                    texts.append(t)
+                q = msg.get("quotedMessage") or {}
+                qt = get_msg_text(q.get("messageId")) if q else None
+                if qt:
+                    quoted_text = qt
 
-        # Аудио
-        if msg_type in ("audio", "voice", "ptt"):
-            send_wazzup_multi(chat_id, channel_id, "Ой, голосовые пока не могу прослушать 🙏 ||| Напишите, пожалуйста, текстом — сразу помогу")
+        combined = " ".join(texts).strip()
+
+        # Только голос и больше ничего
+        if not combined and not photo_descs:
+            if has_audio:
+                send_wazzup_multi(chat_id, channel_id, "Ой, голосовые пока не могу прослушать 🙏 ||| Напишите, пожалуйста, текстом — сразу помогу")
             return
 
-        # Фото от клиента
-        if msg_type in ("image", "photo"):
-            image_url = msg.get("fileUrl") or msg.get("url") or msg.get("imageUrl", "")
-            if image_url:
-                image_reply = analyze_image(image_url)
-                if image_reply:
-                    caption = msg.get("text", "") or msg.get("caption", "")
-                    prompt = f"[Клиент прислал фото. Содержимое: {image_reply}]"
-                    if caption:
-                        prompt += f" Подпись: {caption}"
-                    full_reply = get_ai_response(prompt, chat_id)
-                    save_message(chat_id, "user", f"[фото: {image_reply[:100]}]")
-                    save_message(chat_id, "assistant", full_reply)
-                    send_wazzup_multi(chat_id, channel_id, full_reply)
-                else:
-                    send_wazzup_multi(chat_id, channel_id, "Фото получила, но не открылось 🙈 ||| Пришлите, пожалуйста, ещё разок")
-            return
-
-        # Документы, файлы, видео — НЕ запускаем флоу бронирования (иначе бот выдумывает из истории)
-        if msg_type in ("document", "file", "video", "sticker", "location", "contact"):
-            send_wazzup_multi(chat_id, channel_id, "Спасибо, получила! ||| Передам Асели 🤗 ||| А по датам и брони — напишите, пожалуйста, текстом")
-            return
-
-        text = msg.get("text", "")
-        # Обрабатываем только настоящие текстовые сообщения
-        if msg_type != "text" or not text:
-            return
-
-        # REPLY: если гость ответил на конкретное сообщение — достаём его текст
-        quoted = msg.get("quotedMessage") or {}
-        quoted_text = get_msg_text(quoted.get("messageId")) if quoted else None
-
-        # Фото номеров по запросу. Тип берём из сообщения, а если гость ответил на фото — из цитаты.
-        room_type = detect_room_type(text) or (detect_room_type(quoted_text) if quoted_text else None)
-        foto_keywords = ["фото", "покажи", "фотки", "посмотреть", "как выглядит", "покажите", "фотографии", "скинь", "скиньте", "пришли", "прислать", "загляни", "посмотри"]
-        wants_photo = any(kw in text.lower() for kw in foto_keywords)
+        # Тип номера: из текста, из цитаты, или с присланной карточки/фото
+        room_type = detect_room_type(combined) or (detect_room_type(quoted_text) if quoted_text else None) or room_from_photo
+        wants_photo = any(kw in combined.lower() for kw in FOTO_KEYWORDS)
         if room_type and wants_photo:
             send_room_photos(chat_id, channel_id, room_type)
             time.sleep(0.5)
 
-        # В модель отдаём текст вместе с цитатой (если есть) — чтобы понимал, на что отвечают
-        ai_input = text
+        # Вход для модели: фото-описания + цитата + весь текст пачки
+        ai_input = combined
+        if photo_descs:
+            ai_input = f"[Гость прислал фото, на нём: {'; '.join(photo_descs)}] {ai_input}".strip()
         if quoted_text:
-            ai_input = f"(гость отвечает на ваше сообщение: «{quoted_text}») {text}"
+            ai_input = f"(гость отвечает на ваше сообщение: «{quoted_text}») {ai_input}".strip()
+
         ai_reply = get_ai_response(ai_input, chat_id)
-        save_message(chat_id, "user", text)
+        save_user = combined if combined else f"[фото: {'; '.join(photo_descs)[:100]}]"
+        save_message(chat_id, "user", save_user)
         save_message(chat_id, "assistant", ai_reply)
         send_wazzup_multi(chat_id, channel_id, ai_reply)
     except Exception as e:
-        sys.stderr.write(f"process_wazzup_message error: {e}\n"); sys.stderr.flush()
+        sys.stderr.write(f"flush_chat error: {e}\n"); sys.stderr.flush()
 
 def process_max_message(chat_id, text):
     """FIX #6: фоновая обработка сообщения из MAX."""
@@ -892,7 +933,8 @@ def webhook():
                 sys.stderr.write(f"SKIP duplicate msg_id={msg_id}\n"); sys.stderr.flush()
                 continue
 
-            threading.Thread(target=process_wazzup_message, args=(msg,), daemon=True).start()
+            # Дебаунс: копим сообщения и ответим, когда гость допишет серию
+            enqueue_message(msg)
 
     if data.get("type") == "message_created":
         message = data.get("body", {})
