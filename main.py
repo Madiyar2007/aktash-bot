@@ -6,6 +6,7 @@ import os
 import sqlite3
 import time
 import re
+import threading
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import urllib3
@@ -64,8 +65,9 @@ def detect_room_type(text):
     return None
 
 def init_db():
-    conn = sqlite3.connect('chat_history.db')
+    conn = sqlite3.connect('chat_history.db', timeout=10)
     c = conn.cursor()
+    c.execute('PRAGMA journal_mode=WAL')  # лучше переносит одновременную запись из потоков
     # FIX #4: явный автоинкрементный id — сортируем по нему, а не по timestamp (точность до секунды ломала порядок ролей)
     c.execute('''CREATE TABLE IF NOT EXISTS messages
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -78,7 +80,7 @@ def init_db():
     conn.close()
 
 def get_history(chat_id):
-    conn = sqlite3.connect('chat_history.db')
+    conn = sqlite3.connect('chat_history.db', timeout=10)
     c = conn.cursor()
     # FIX #4: ORDER BY id (а не timestamp) — стабильный порядок вопрос/ответ
     c.execute('SELECT role, content FROM messages WHERE chat_id = ? ORDER BY id DESC LIMIT 20', (chat_id,))
@@ -88,29 +90,35 @@ def get_history(chat_id):
     return [{"role": row[0], "content": row[1]} for row in rows]
 
 def save_message(chat_id, role, content):
-    conn = sqlite3.connect('chat_history.db')
+    conn = sqlite3.connect('chat_history.db', timeout=10)
     c = conn.cursor()
     c.execute('INSERT INTO messages (chat_id, role, content) VALUES (?, ?, ?)', (chat_id, role, content))
     conn.commit()
     conn.close()
 
 def already_processed(message_id):
-    """FIX #5: True если это сообщение уже обрабатывали (защита от ретраев вебхука Wazzup)."""
+    """FIX #5: True если это сообщение уже обрабатывали. Атомарно — решаем по факту INSERT, а не SELECT+INSERT."""
     now = time.time()
-    conn = sqlite3.connect('chat_history.db')
+    conn = sqlite3.connect('chat_history.db', timeout=10)
     c = conn.cursor()
     c.execute('DELETE FROM seen_messages WHERE ts < ?', (now - 3600,))  # лёгкая чистка старого
-    c.execute('SELECT 1 FROM seen_messages WHERE message_id = ?', (message_id,))
-    seen = c.fetchone() is not None
-    if not seen:
-        c.execute('INSERT OR IGNORE INTO seen_messages (message_id, ts) VALUES (?, ?)', (message_id, now))
-    conn.commit()
+    try:
+        c.execute('INSERT INTO seen_messages (message_id, ts) VALUES (?, ?)', (message_id, now))
+        conn.commit()
+        seen = False
+    except sqlite3.IntegrityError:
+        seen = True  # такой message_id уже есть — это дубликат
     conn.close()
     return seen
 
 init_db()
 
+_bnovo_token = {"token": None, "exp": 0}
+
 def get_bnovo_token():
+    now = time.time()
+    if _bnovo_token["token"] and now < _bnovo_token["exp"]:
+        return _bnovo_token["token"]
     try:
         auth = requests.post(
             f'{BNOVO_BASE_URL}/api/v1/auth',
@@ -118,14 +126,17 @@ def get_bnovo_token():
             verify=False, timeout=10
         )
         if auth.status_code == 200:
-            return auth.json()['data']['access_token']
+            tok = auth.json()['data']['access_token']
+            _bnovo_token["token"] = tok
+            _bnovo_token["exp"] = now + 300  # кэш на 5 минут
+            return tok
         sys.stderr.write(f"BNOVO auth status={auth.status_code} {auth.text[:200]}\n"); sys.stderr.flush()
     except Exception as e:
         # FIX #7: не глотаем ошибку молча
         sys.stderr.write(f"BNOVO auth error: {e}\n"); sys.stderr.flush()
     return None
 
-def check_availability_by_type(date_from, date_to):
+def check_availability_by_type(date_from, date_to, _retry=True):
     token = get_bnovo_token()
     if not token:
         return None
@@ -138,30 +149,73 @@ def check_availability_by_type(date_from, date_to):
         )
         if r.status_code == 200:
             return r.json()['data']
+        if r.status_code == 401 and _retry:
+            _bnovo_token["token"] = None  # токен протух — сбрасываем кэш и пробуем ещё раз
+            return check_availability_by_type(date_from, date_to, _retry=False)
         sys.stderr.write(f"BNOVO availability status={r.status_code} {r.text[:200]}\n"); sys.stderr.flush()
     except Exception as e:
         sys.stderr.write(f"BNOVO availability error: {e}\n"); sys.stderr.flush()
     return None
 
-def format_availability(data, date_from, date_to):
-    if data is None:
-        return f"Данные о наличии недоступны на {date_from} - {date_to}."
-    result = []
+def free_room_types(data, date_to):
+    """Названия типов, свободных на ВЕСЬ запрошенный период (использует проверенную min-логику)."""
+    free = []
+    if not data:
+        return free
     for type_id_str, info in data.items():
         type_id = int(type_id_str)
-        name = ROOM_TYPES.get(type_id, f"Тип {type_id}")
-        full = info.get('full_quantity', 0)
-        if full == 0:
+        name = ROOM_TYPES.get(type_id)
+        if not name:
             continue
-        avail_values = list(info.get('availability', {}).values())
-        min_avail = min(avail_values) if avail_values else 0
-        if min_avail > 0:
-            result.append(f"{name}: есть")
-        else:
-            result.append(f"{name}: занят")
-    if not result:
-        return f"На {date_from} - {date_to} свободных номеров нет."
-    return "Наличие на " + date_from + " - " + date_to + ": " + "; ".join(result)
+        if info.get('full_quantity', 0) == 0:
+            continue
+        avail = info.get('availability', {})
+        # FIX #8: исключаем дату выезда — это не занятая ночь
+        vals = [v for k, v in avail.items() if k != date_to]
+        if not vals:
+            vals = list(avail.values())
+        if vals and min(vals) > 0:
+            free.append(name)
+    return free
+
+def find_alternatives(date_from, nights, today, max_days=10, max_options=2):
+    """Ищет ближайшие свободные даты той же длины (и до, и после запрошенных)."""
+    options = []
+    seen = set()
+    base = datetime.strptime(date_from, '%Y-%m-%d')
+    for shift in range(1, max_days + 1):
+        for direction in (1, -1):
+            start = base + timedelta(days=shift * direction)
+            if start.date() < today.date():
+                continue
+            sf = start.strftime('%Y-%m-%d')
+            if sf in seen:
+                continue
+            seen.add(sf)
+            st = (start + timedelta(days=nights)).strftime('%Y-%m-%d')
+            free = free_room_types(check_availability_by_type(sf, st), st)
+            if free:
+                options.append((sf, st, free))
+                if len(options) >= max_options:
+                    return options
+        if options:  # нашли на ближайшем сдвиге — дальше не ищем
+            return options
+    return options
+
+def build_availability_context(date_from, date_to, today):
+    data = check_availability_by_type(date_from, date_to)
+    if data is None:
+        return f"Данные о наличии недоступны на {date_from} - {date_to}."
+    free = free_room_types(data, date_to)
+    if free:
+        return f"Наличие на {date_from} - {date_to}: свободно — {', '.join(free)}."
+    # Всё занято — ищем ближайшие свободные даты
+    nights = max(1, (datetime.strptime(date_to, '%Y-%m-%d') - datetime.strptime(date_from, '%Y-%m-%d')).days)
+    alts = find_alternatives(date_from, nights, today)
+    if not alts:
+        return f"На {date_from} - {date_to} всё занято. Свободных дат в ближайшие 10 дней нет."
+    parts = [f"{af} - {at} ({', '.join(fr)})" for af, at, fr in alts]
+    return f"На {date_from} - {date_to} всё занято. Ближайшие свободные даты: " + "; ".join(parts) + "."
 
 SYSTEM_PROMPT = """АБСОЛЮТНЫЕ ЗАПРЕТЫ:
 - Никогда не говори клиенту "напишите на номер +7-913-693-68-19 за фото" — фото отправляются автоматически
@@ -193,8 +247,10 @@ SYSTEM_PROMPT = """АБСОЛЮТНЫЕ ЗАПРЕТЫ:
 
 НАЛИЧИЕ НОМЕРОВ:
 Используй [BNOVO_DATA] — там реальные данные.
-Предлагай только те типы где написано "есть".
+Предлагай только свободные типы из [BNOVO_DATA].
 Не называй количество свободных номеров.
+Если на запрошенные даты всё занято, а в [BNOVO_DATA] есть "ближайшие свободные даты" — мягко предложи их клиенту как вариант. Например: "На эти даты всё занято ||| Но свободно с 14 по 17 июня — Лофт, A-Frame ||| Подойдёт?"
+Если свободных дат нет совсем — предложи позвонить Асели.
 
 СБОР ДАННЫХ для брони: даты, ночи, взрослые, дети и возраст, животные.
 Считай стоимость только когда знаешь всё.
@@ -314,6 +370,16 @@ def extract_dates(text):
                 dates.append(d)
     return dates
 
+def extract_nights(text):
+    """FIX #8: сколько ночей просит гость. None если не указано."""
+    tl = text.lower()
+    m = re.search(r'(\d{1,2})\s*ноч', tl)
+    if m:
+        return max(1, int(m.group(1)))
+    if 'недел' in tl:
+        return 7
+    return None
+
 def analyze_image(image_url):
     try:
         img_response = requests.get(image_url, timeout=10, verify=False)
@@ -336,22 +402,43 @@ def analyze_image(image_url):
         sys.stderr.write(f"Image error: {e}\n")
         return None
 
+AVAIL_KW = ["свобод", "есть ли", "можно", "можете", "забронир", "брон", "заезд",
+            "засел", "размест", "ноч", "чел", "человек", "мест", "приед",
+            "остановит", "номер", "дата", "числ"]
+
 def get_ai_response(user_message, chat_id):
     history = get_history(chat_id)
     bnovo_context = ""
+    msg_low = user_message.lower()
     dates = extract_dates(user_message)
-    if not dates:
+    # Гейт: наличие подтягиваем только если сообщение про даты/номера/бронь,
+    # а не на "баня есть?" / "да" — иначе цепляем стейл-даты из истории.
+    intent = bool(dates) or detect_room_type(user_message) or any(kw in msg_low for kw in AVAIL_KW)
+    if intent and not dates:
         for h in reversed(history):
             if h['role'] == 'user':
                 found = extract_dates(h['content'])
                 if found:
                     dates = found
                     break
-    if dates:
+    if intent and dates:
         date_from = dates[0]
-        date_to = (datetime.strptime(date_from, '%Y-%m-%d') + timedelta(days=3)).strftime('%Y-%m-%d') if len(dates) < 2 else dates[1]
-        data = check_availability_by_type(date_from, date_to)
-        bnovo_context = f"\n[BNOVO_DATA]: {format_availability(data, date_from, date_to)}"
+        if len(dates) >= 2:
+            date_to = dates[1]
+        else:
+            # FIX #8: дефолт 1 ночь (а не 3), либо число из "на N ночей" / "на неделю"
+            nights = extract_nights(user_message)
+            if nights is None:
+                for h in reversed(history):
+                    if h['role'] == 'user':
+                        n = extract_nights(h['content'])
+                        if n:
+                            nights = n
+                            break
+            nights = nights or 1
+            date_to = (datetime.strptime(date_from, '%Y-%m-%d') + timedelta(days=nights)).strftime('%Y-%m-%d')
+        data_ctx = build_availability_context(date_from, date_to, datetime.now())
+        bnovo_context = f"\n[BNOVO_DATA]: {data_ctx}"
     sys.stderr.write(f"DEBUG dates={dates} | bnovo={bnovo_context[:150]}\n"); sys.stderr.flush()
     messages = history + [{"role": "user", "content": user_message + bnovo_context}]
     response = client.messages.create(
@@ -415,12 +502,79 @@ def send_max_multi(chat_id, full_text):
         send_max_message(chat_id, part)
         time.sleep(0.4)
 
+def process_wazzup_message(msg):
+    """FIX #6: тяжёлая обработка одного сообщения (вызывается в фоновом потоке)."""
+    try:
+        chat_id = msg.get("chatId", "")
+        channel_id = msg.get("channelId", "")
+        msg_type = msg.get("type", "text")
+
+        # Аудио
+        if msg_type in ("audio", "voice", "ptt"):
+            send_wazzup_message(chat_id, channel_id, "Голосовые не принимаю — напишите текстом")
+            return
+
+        # Фото от клиента
+        if msg_type in ("image", "photo"):
+            image_url = msg.get("fileUrl") or msg.get("url") or msg.get("imageUrl", "")
+            if image_url:
+                image_reply = analyze_image(image_url)
+                if image_reply:
+                    caption = msg.get("text", "") or msg.get("caption", "")
+                    prompt = f"[Клиент прислал фото. Содержимое: {image_reply}]"
+                    if caption:
+                        prompt += f" Подпись: {caption}"
+                    full_reply = get_ai_response(prompt, chat_id)
+                    save_message(chat_id, "user", f"[фото: {image_reply[:100]}]")
+                    save_message(chat_id, "assistant", full_reply)
+                    send_wazzup_multi(chat_id, channel_id, full_reply)
+                else:
+                    send_wazzup_message(chat_id, channel_id, "Фото получила, но не смогла открыть. Попробуйте ещё раз")
+            return
+
+        # Документы, файлы, видео — НЕ запускаем флоу бронирования (иначе бот выдумывает из истории)
+        if msg_type in ("document", "file", "video", "sticker", "location", "contact"):
+            send_wazzup_message(chat_id, channel_id, "Документ получила, передам Асели. По датам и бронированию — напишите, пожалуйста, текстом")
+            return
+
+        text = msg.get("text", "")
+        # Обрабатываем только настоящие текстовые сообщения
+        if msg_type != "text" or not text:
+            return
+
+        # Фото номеров по запросу
+        room_type = detect_room_type(text)
+        foto_keywords = ["фото", "покажи", "фотки", "посмотреть", "как выглядит", "покажите", "фотографии", "скинь", "скиньте", "пришли", "прислать", "загляни", "посмотри"]
+        wants_photo = any(kw in text.lower() for kw in foto_keywords)
+        if room_type and wants_photo:
+            send_room_photos(chat_id, channel_id, room_type)
+            time.sleep(0.5)
+
+        ai_reply = get_ai_response(text, chat_id)
+        save_message(chat_id, "user", text)
+        save_message(chat_id, "assistant", ai_reply)
+        send_wazzup_multi(chat_id, channel_id, ai_reply)
+    except Exception as e:
+        sys.stderr.write(f"process_wazzup_message error: {e}\n"); sys.stderr.flush()
+
+def process_max_message(chat_id, text):
+    """FIX #6: фоновая обработка сообщения из MAX."""
+    try:
+        ai_reply = get_ai_response(text, chat_id)
+        save_message(chat_id, "user", text)
+        save_message(chat_id, "assistant", ai_reply)
+        send_max_multi(chat_id, ai_reply)
+    except Exception as e:
+        sys.stderr.write(f"process_max_message error: {e}\n"); sys.stderr.flush()
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json(silent=True)  # FIX #7: не падаем на кривом payload
     if not data:
         return "OK"
     sys.stderr.write(f"WEBHOOK: {str(data)[:300]}\n"); sys.stderr.flush()
+
+    # FIX #6: дедуп делаем синхронно (быстро), тяжёлую обработку — в фон, и сразу отдаём 200 OK.
     if "messages" in data:
         for msg in data.get("messages", []):
             sys.stderr.write(f"MSG status={msg.get('status')} type={msg.get('type')} text={msg.get('text','')[:50]}\n"); sys.stderr.flush()
@@ -429,68 +583,23 @@ def webhook():
             if msg.get("chatType") == "whatsgroup":
                 continue
             chat_id = msg.get("chatId", "")
-            channel_id = msg.get("channelId", "")
             if not chat_id:
                 continue
 
-            # FIX #5: дедуп по id сообщения (а не по chat_id+5сек, который глушил быстрые follow-up)
+            # FIX #5: дедуп по id сообщения
             msg_id = msg.get("messageId") or f"{chat_id}:{msg.get('text','')[:30]}:{int(time.time())}"
             if already_processed(msg_id):
                 sys.stderr.write(f"SKIP duplicate msg_id={msg_id}\n"); sys.stderr.flush()
                 continue
 
-            msg_type = msg.get("type", "text")
+            threading.Thread(target=process_wazzup_message, args=(msg,), daemon=True).start()
 
-            # Аудио
-            if msg_type in ("audio", "voice", "ptt"):
-                send_wazzup_message(chat_id, channel_id, "Голосовые не принимаю — напишите текстом")
-                continue
-
-            # Фото от клиента
-            if msg_type in ("image", "photo"):
-                image_url = msg.get("fileUrl") or msg.get("url") or msg.get("imageUrl", "")
-                if image_url:
-                    image_reply = analyze_image(image_url)
-                    if image_reply:
-                        caption = msg.get("text", "") or msg.get("caption", "")
-                        prompt = f"[Клиент прислал фото. Содержимое: {image_reply}]"
-                        if caption:
-                            prompt += f" Подпись: {caption}"
-                        full_reply = get_ai_response(prompt, chat_id)
-                        save_message(chat_id, "user", f"[фото: {image_reply[:100]}]")
-                        save_message(chat_id, "assistant", full_reply)
-                        send_wazzup_multi(chat_id, channel_id, full_reply)
-                    else:
-                        send_wazzup_message(chat_id, channel_id, "Фото получила, но не смогла открыть. Попробуйте ещё раз")
-                continue
-
-            text = msg.get("text", "")
-            if not text:
-                continue
-
-            # Фото номеров по запросу
-            room_type = detect_room_type(text)
-            foto_keywords = ["фото", "покажи", "фотки", "посмотреть", "как выглядит", "покажите", "фотографии", "скинь", "скиньте", "пришли", "прислать", "загляни", "посмотри"]
-            wants_photo = any(kw in text.lower() for kw in foto_keywords)
-            if room_type and wants_photo:
-                send_room_photos(chat_id, channel_id, room_type)
-                time.sleep(0.5)
-
-            ai_reply = get_ai_response(text, chat_id)
-            save_message(chat_id, "user", text)
-            save_message(chat_id, "assistant", ai_reply)
-            send_wazzup_multi(chat_id, channel_id, ai_reply)
-
-    event_type = data.get("type")
-    if event_type == "message_created":
+    if data.get("type") == "message_created":
         message = data.get("body", {})
         text = message.get("text", "")
         chat_id = data.get("recipient", {}).get("chat_id")
         if text and chat_id:
-            ai_reply = get_ai_response(text, chat_id)
-            save_message(chat_id, "user", text)
-            save_message(chat_id, "assistant", ai_reply)
-            send_max_multi(chat_id, ai_reply)
+            threading.Thread(target=process_max_message, args=(chat_id, text), daemon=True).start()
 
     return "OK"
 
@@ -500,4 +609,4 @@ def index():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, threaded=True)
