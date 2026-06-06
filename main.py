@@ -199,6 +199,43 @@ def check_availability_by_type(date_from, date_to, _retry=True):
         sys.stderr.write(f"BNOVO availability error: {e}\n"); sys.stderr.flush()
     return None
 
+# Модули у речки (room_id из Bnovo): 17, 18, 19. Модуль 20 (797501) — НЕ у речки.
+RIVER_MODUL_IDS = {790546, 790547, 790548}   # 17, 18, 19 — у речки
+MODUL_20_ID = 797501                          # 20 — отдельно, не у речки
+
+def modul_river_status(date_from, date_to, _retry=True):
+    """Для Модуля: есть ли свободный речной модуль (17-19) на весь период.
+    Возвращает 'river' (есть у речки), 'far' (свободен только 20), None (нет данных/занято всё)."""
+    token = get_bnovo_token()
+    if not token:
+        return None
+    try:
+        r = requests.get(
+            f'{BNOVO_BASE_URL}/api/v1/availability/rooms',
+            params={'date_from': date_from, 'date_to': date_to},
+            headers={'Authorization': f'Bearer {token}'}, verify=False, timeout=10
+        )
+        if r.status_code == 401 and _retry:
+            _bnovo_token["token"] = None
+            return modul_river_status(date_from, date_to, _retry=False)
+        if r.status_code != 200:
+            sys.stderr.write(f"BNOVO rooms status={r.status_code} {r.text[:150]}\n"); sys.stderr.flush()
+            return None
+        rooms = r.json().get('data') or {}
+        if isinstance(rooms, dict) and "rooms" in rooms:  # формат {"rooms":[...]}
+            rooms = {str(x.get("room_id") or x.get("id")): x for x in rooms["rooms"]}
+        def free_all(rid):
+            info = rooms.get(str(rid)) or rooms.get(rid)
+            return bool(info) and info.get("all_period") is True
+        if any(free_all(rid) for rid in RIVER_MODUL_IDS):
+            return "river"
+        if free_all(MODUL_20_ID):
+            return "far"
+        return None
+    except Exception as e:
+        sys.stderr.write(f"modul_river_status error: {e}\n"); sys.stderr.flush()
+        return None
+
 def free_room_types(data, date_to):
     """Названия типов, свободных на ВЕСЬ запрошенный период (использует проверенную min-логику)."""
     free = []
@@ -361,7 +398,15 @@ def build_availability_context(date_from, date_to, today):
         return f"Данные о наличии недоступны на {date_from} - {date_to}."
     free = free_room_types(data, date_to)
     if free:
-        return f"Наличие на {date_from} - {date_to}: свободно — {', '.join(free)}."
+        ctx = f"Наличие на {date_from} - {date_to}: свободно — {', '.join(free)}."
+        # Для Модуля уточняем у речки или нет (внутри типа есть и речные, и №20 в стороне)
+        if "Модуль" in free:
+            status = modul_river_status(date_from, date_to)
+            if status == "river":
+                ctx += " Модуль: есть свободный у речки."
+            elif status == "far":
+                ctx += " Модуль: у речки занято, свободен только модуль №20 — он в стороне от речки, не обещай гостю речку для него."
+        return ctx
     # Всё занято — ищем ближайшие свободные даты
     nights = max(1, (datetime.strptime(date_to, '%Y-%m-%d') - datetime.strptime(date_from, '%Y-%m-%d')).days)
     alts = find_alternatives(date_from, nights, today)
@@ -437,7 +482,8 @@ SYSTEM_PROMPT = """Ты — Асель, менеджер эко-отеля «А�
 Если подходящий вариант ОДИН — НЕ упоминай соседей ВООБЩЕ: ни что они «будут», ни что их «не будет», ни «живёте одни», ни «без соседей». Просто молчи про эту тему.
 
 РАСПОЛОЖЕНИЕ:
-У речки: Лофт, Модуль, Коттедж. Не у речки: A-Frame, Стандарт домик.
+У речки: Лофт, Коттедж. A-Frame и Стандарт домик — НЕ у речки.
+Модуль — особый случай: часть модулей у речки, а модуль №20 в стороне. НЕ обещай речку для модуля сам по себе. Ориентируйся на пометку в [BNOVO_DATA]: если там «есть свободный у речки» — можешь сказать «модуль у речки ✅»; если «свободен только модуль №20 / в стороне» — честно скажи, что свободный модуль чуть в стороне от речки, речку не обещай. Номер №20 гостю не называй.
 Про вид на горы и тишину НЕ пиши сам — только если гость прямо спросит (у всех вид на горы, везде тихо).
 
 ССЫЛКА НА БРОНИРОВАНИЕ:
