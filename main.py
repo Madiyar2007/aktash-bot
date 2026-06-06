@@ -743,6 +743,10 @@ def webhook():
     # FIX #6: дедуп делаем синхронно (быстро), тяжёлую обработку — в фон, и сразу отдаём 200 OK.
     if "messages" in data:
         for msg in data.get("messages", []):
+            if msg.get("status") == "inbound":
+                # ВРЕМЕННО: полный JSON входящего, чтобы увидеть поля reply/цитаты
+                import json as _json
+                sys.stderr.write(f"FULL_MSG: {_json.dumps(msg, ensure_ascii=False)}\n"); sys.stderr.flush()
             sys.stderr.write(f"MSG status={msg.get('status')} type={msg.get('type')} text={msg.get('text','')[:50]}\n"); sys.stderr.flush()
             if msg.get("status") != "inbound":
                 continue
