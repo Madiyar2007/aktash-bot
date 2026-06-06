@@ -66,17 +66,22 @@ def detect_room_type(text):
 def init_db():
     conn = sqlite3.connect('chat_history.db')
     c = conn.cursor()
+    # FIX #4: явный автоинкрементный id — сортируем по нему, а не по timestamp (точность до секунды ломала порядок ролей)
     c.execute('''CREATE TABLE IF NOT EXISTS messages
-                 (chat_id TEXT, role TEXT, content TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS dedup
-                 (chat_id TEXT PRIMARY KEY, last_time REAL)''')
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  chat_id TEXT, role TEXT, content TEXT,
+                  timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+    # FIX #5: дедуп по реальному id сообщения, а не "любое сообщение от чата за 5 сек"
+    c.execute('''CREATE TABLE IF NOT EXISTS seen_messages
+                 (message_id TEXT PRIMARY KEY, ts REAL)''')
     conn.commit()
     conn.close()
 
 def get_history(chat_id):
     conn = sqlite3.connect('chat_history.db')
     c = conn.cursor()
-    c.execute('SELECT role, content FROM messages WHERE chat_id = ? ORDER BY timestamp DESC LIMIT 20', (chat_id,))
+    # FIX #4: ORDER BY id (а не timestamp) — стабильный порядок вопрос/ответ
+    c.execute('SELECT role, content FROM messages WHERE chat_id = ? ORDER BY id DESC LIMIT 20', (chat_id,))
     rows = c.fetchall()
     conn.close()
     rows.reverse()
@@ -89,6 +94,20 @@ def save_message(chat_id, role, content):
     conn.commit()
     conn.close()
 
+def already_processed(message_id):
+    """FIX #5: True если это сообщение уже обрабатывали (защита от ретраев вебхука Wazzup)."""
+    now = time.time()
+    conn = sqlite3.connect('chat_history.db')
+    c = conn.cursor()
+    c.execute('DELETE FROM seen_messages WHERE ts < ?', (now - 3600,))  # лёгкая чистка старого
+    c.execute('SELECT 1 FROM seen_messages WHERE message_id = ?', (message_id,))
+    seen = c.fetchone() is not None
+    if not seen:
+        c.execute('INSERT OR IGNORE INTO seen_messages (message_id, ts) VALUES (?, ?)', (message_id, now))
+    conn.commit()
+    conn.close()
+    return seen
+
 init_db()
 
 def get_bnovo_token():
@@ -100,8 +119,10 @@ def get_bnovo_token():
         )
         if auth.status_code == 200:
             return auth.json()['data']['access_token']
-    except:
-        pass
+        sys.stderr.write(f"BNOVO auth status={auth.status_code} {auth.text[:200]}\n"); sys.stderr.flush()
+    except Exception as e:
+        # FIX #7: не глотаем ошибку молча
+        sys.stderr.write(f"BNOVO auth error: {e}\n"); sys.stderr.flush()
     return None
 
 def check_availability_by_type(date_from, date_to):
@@ -117,8 +138,9 @@ def check_availability_by_type(date_from, date_to):
         )
         if r.status_code == 200:
             return r.json()['data']
-    except:
-        pass
+        sys.stderr.write(f"BNOVO availability status={r.status_code} {r.text[:200]}\n"); sys.stderr.flush()
+    except Exception as e:
+        sys.stderr.write(f"BNOVO availability error: {e}\n"); sys.stderr.flush()
     return None
 
 def format_availability(data, date_from, date_to):
@@ -239,20 +261,57 @@ MONTHS = {
     'октябр': '10', 'окт': '10', 'ноябр': '11', 'декабр': '12'
 }
 
+def _month_from_word(word):
+    for key, num in MONTHS.items():
+        if word.startswith(key):
+            return int(num)
+    return None
+
+def _make_date(day, month, today):
+    """FIX #3: год выбираем динамически. Если дата в этом году уже прошла — берём следующий."""
+    for year in (today.year, today.year + 1):
+        try:
+            d = datetime(year, month, day)
+        except ValueError:
+            return None  # невалидный день/месяц (напр. 31 июня) — для любого года невалиден
+        if d.date() >= (today.date() - timedelta(days=1)):
+            return d.strftime('%Y-%m-%d')
+    return None
+
 def extract_dates(text):
     text_low = text.lower()
+    today = datetime.now()
     dates = []
-    for m in re.findall(r'(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{4})', text):
-        dates.append(f"{m[2]}-{int(m[1]):02d}-{int(m[0]):02d}")
+
+    # 1) Явные числовые даты: 21.06.2026 / 21-06-26 / 21/6/2026
+    for m in re.findall(r'(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{2,4})', text):
+        day, month = int(m[0]), int(m[1])
+        year = int(m[2])
+        year += 2000 if year < 100 else 0
+        try:
+            dates.append(datetime(year, month, day).strftime('%Y-%m-%d'))
+        except ValueError:
+            pass
     if dates:
         return dates
-    for m in re.findall(r'(\d{1,2})\s*([а-я]+)', text_low):
-        day = int(m[0])
-        month_word = m[1]
-        for key, num in MONTHS.items():
-            if month_word.startswith(key):
-                dates.append(f"2026-{num}-{day:02d}")
-                break
+
+    # 2) FIX #2: диапазон с общим месяцем — "с 9 по 13 июня", "9-13 июня"
+    rng = re.search(r'(\d{1,2})\s*(?:по|до|[-–—])\s*(\d{1,2})\s*([а-я]+)', text_low)
+    if rng:
+        month = _month_from_word(rng.group(3))
+        if month:
+            d1 = _make_date(int(rng.group(1)), month, today)
+            d2 = _make_date(int(rng.group(2)), month, today)
+            if d1 and d2:
+                return [d1, d2]
+
+    # 3) Одиночные пары "число месяц" — "13 июня", "с 9 июня по 13 июля"
+    for m in re.finditer(r'(\d{1,2})\s*([а-я]+)', text_low):
+        month = _month_from_word(m.group(2))
+        if month:
+            d = _make_date(int(m.group(1)), month, today)
+            if d:
+                dates.append(d)
     return dates
 
 def analyze_image(image_url):
@@ -307,16 +366,24 @@ def send_wazzup_message(chat_id, channel_id, text):
     url = "https://api.wazzup24.com/v3/message"
     headers = {"Authorization": f"Bearer {WAZZUP_API_KEY}", "Content-Type": "application/json"}
     payload = {"channelId": channel_id, "chatId": chat_id, "chatType": "whatsapp", "text": text}
-    r = requests.post(url, json=payload, headers=headers)
-    return r.status_code
+    try:
+        r = requests.post(url, json=payload, headers=headers, timeout=15)  # FIX #7: timeout
+        return r.status_code
+    except Exception as e:
+        sys.stderr.write(f"Wazzup send error: {e}\n"); sys.stderr.flush()
+        return None
 
 def send_wazzup_photo(chat_id, channel_id, image_url):
     url = "https://api.wazzup24.com/v3/message"
     headers = {"Authorization": f"Bearer {WAZZUP_API_KEY}", "Content-Type": "application/json"}
     payload = {"channelId": channel_id, "chatId": chat_id, "chatType": "whatsapp", "contentUri": image_url}
-    r = requests.post(url, json=payload, headers=headers)
-    sys.stderr.write(f"PHOTO: {r.status_code} {image_url[-30:]}\n"); sys.stderr.flush()
-    return r.status_code
+    try:
+        r = requests.post(url, json=payload, headers=headers, timeout=15)  # FIX #7: timeout
+        sys.stderr.write(f"PHOTO: {r.status_code} {image_url[-30:]}\n"); sys.stderr.flush()
+        return r.status_code
+    except Exception as e:
+        sys.stderr.write(f"Wazzup photo error: {e}\n"); sys.stderr.flush()
+        return None
 
 def send_room_photos(chat_id, channel_id, room_type):
     photos = ROOM_PHOTOS.get(room_type, [])
@@ -336,7 +403,10 @@ def send_max_message(chat_id, text):
     url = "https://botapi.max.ru/messages"
     params = {"access_token": MAX_TOKEN}
     payload = {"recipient": {"chat_id": chat_id}, "text": text}
-    requests.post(url, params=params, json=payload)
+    try:
+        requests.post(url, params=params, json=payload, timeout=15)  # FIX #7: timeout
+    except Exception as e:
+        sys.stderr.write(f"Max send error: {e}\n"); sys.stderr.flush()
 
 def send_max_multi(chat_id, full_text):
     parts = [p.strip() for p in full_text.split("|||") if p.strip()]
@@ -347,7 +417,7 @@ def send_max_multi(chat_id, full_text):
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.json
+    data = request.get_json(silent=True)  # FIX #7: не падаем на кривом payload
     if not data:
         return "OK"
     sys.stderr.write(f"WEBHOOK: {str(data)[:300]}\n"); sys.stderr.flush()
@@ -362,6 +432,13 @@ def webhook():
             channel_id = msg.get("channelId", "")
             if not chat_id:
                 continue
+
+            # FIX #5: дедуп по id сообщения (а не по chat_id+5сек, который глушил быстрые follow-up)
+            msg_id = msg.get("messageId") or f"{chat_id}:{msg.get('text','')[:30]}:{int(time.time())}"
+            if already_processed(msg_id):
+                sys.stderr.write(f"SKIP duplicate msg_id={msg_id}\n"); sys.stderr.flush()
+                continue
+
             msg_type = msg.get("type", "text")
 
             # Аудио
@@ -390,20 +467,6 @@ def webhook():
             text = msg.get("text", "")
             if not text:
                 continue
-
-            # Deduplikatsiya cherez SQLite
-            now = time.time()
-            conn_d = sqlite3.connect('chat_history.db')
-            c_d = conn_d.cursor()
-            c_d.execute('SELECT last_time FROM dedup WHERE chat_id = ?', (chat_id,))
-            row = c_d.fetchone()
-            if row and now - row[0] < 5:
-                conn_d.close()
-                sys.stderr.write(f"SKIP duplicate for {chat_id}\n"); sys.stderr.flush()
-                continue
-            c_d.execute('INSERT OR REPLACE INTO dedup (chat_id, last_time) VALUES (?, ?)', (chat_id, now))
-            conn_d.commit()
-            conn_d.close()
 
             # Фото номеров по запросу
             room_type = detect_room_type(text)
