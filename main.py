@@ -23,6 +23,12 @@ BNOVO_PASSWORD = os.getenv("BNOVO_PASSWORD")
 BNOVO_USER_ID = 118966
 BNOVO_BASE_URL = 'https://api.pms.bnovo.ru'
 
+# Модуль бронирования (UUID объекта в reservationsteps)
+BOOKING_MODULE_ID = "5c80b571-1fa1-4282-a76f-8ef53b8da612"
+
+# Канал Wazzup (для исходящих сообщений из вебхука Bnovo, где канала в запросе нет)
+WAZZUP_CHANNEL_ID = os.getenv("WAZZUP_CHANNEL_ID", "f2fb13af-f426-40ef-a3f0-f7c5f5bb3310")
+
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 
@@ -76,6 +82,9 @@ def init_db():
     # FIX #5: дедуп по реальному id сообщения, а не "любое сообщение от чата за 5 сек"
     c.execute('''CREATE TABLE IF NOT EXISTS seen_messages
                  (message_id TEXT PRIMARY KEY, ts REAL)''')
+    # Подтверждённые оплаты броней — чтобы не слать гостю подтверждение повторно
+    c.execute('''CREATE TABLE IF NOT EXISTS confirmed_bookings
+                 (booking_id TEXT PRIMARY KEY, ts REAL)''')
     conn.commit()
     conn.close()
 
@@ -162,24 +171,130 @@ def free_room_types(data, date_to):
     free = []
     if not data:
         return free
-    for type_id_str, info in data.items():
-        type_id = int(type_id_str)
+    # Bnovo может вернуть data как dict {type_id: info} или как list [info, ...]
+    items = data.items() if isinstance(data, dict) else enumerate(data)
+    for type_id_str, info in items:
+        if not isinstance(info, dict):
+            continue
+        try:
+            type_id = int(info.get('id', type_id_str))
+        except (ValueError, TypeError):
+            continue
         name = ROOM_TYPES.get(type_id)
         if not name:
             continue
         if info.get('full_quantity', 0) == 0:
             continue
         avail = info.get('availability', {})
-        # FIX #8: исключаем дату выезда — это не занятая ночь
-        vals = [v for k, v in avail.items() if k != date_to]
-        if not vals:
-            vals = list(avail.values())
+        # availability тоже бывает dict {дата: число} или list [число, ...]
+        if isinstance(avail, dict):
+            vals = [v for k, v in avail.items() if k != date_to]
+            if not vals:
+                vals = list(avail.values())
+        elif isinstance(avail, list):
+            vals = avail[:-1] if len(avail) > 1 else avail  # исключаем последнюю (дата выезда)
+        else:
+            vals = []
+        # оставляем только числовые значения
+        vals = [v for v in vals if isinstance(v, (int, float))]
         if vals and min(vals) > 0:
             free.append(name)
     return free
 
+def in_season(d):
+    """Сезон базы: 28 апреля — 28 сентября, ежегодно (проверка по месяцу-дню, год не важен)."""
+    after_start = (d.month, d.day) >= (4, 28)
+    before_end = (d.month, d.day) <= (9, 28)
+    return after_start and before_end
+
+def build_booking_link(date_from, date_to, adults=2, phone=None):
+    """Ссылка на модуль бронирования с предзаполненными датами и гостями.
+    date_from/date_to приходят как ГГГГ-ММ-ДД, модуль ждёт ДД-ММ-ГГГГ."""
+    try:
+        df = datetime.strptime(date_from, '%Y-%m-%d').strftime('%d-%m-%Y')
+        dt = datetime.strptime(date_to, '%Y-%m-%d').strftime('%d-%m-%Y')
+    except (ValueError, TypeError):
+        return None
+    adults = max(1, int(adults)) if str(adults).isdigit() else 2
+    url = (f"https://reservationsteps.ru/rooms/index/{BOOKING_MODULE_ID}"
+           f"?lang=ru&scroll_to_rooms=1&is_auto_search=1"
+           f"&dfrom={df}&dto={dt}&adults={adults}")
+    if phone:  # предзаполняем телефон гостя — так бронь сматчится с его WhatsApp
+        url += f"&phone={phone}"
+    return url
+
+def bnovo_get(path, _retry=True):
+    """GET к Bnovo с токеном и ретраем на 401. Возвращает поле data или None."""
+    token = get_bnovo_token()
+    if not token:
+        return None
+    try:
+        r = requests.get(f'{BNOVO_BASE_URL}{path}',
+                         headers={'Authorization': f'Bearer {token}'},
+                         verify=False, timeout=10)
+        if r.status_code == 200:
+            return r.json().get('data')
+        if r.status_code == 401 and _retry:
+            _bnovo_token["token"] = None
+            return bnovo_get(path, _retry=False)
+        sys.stderr.write(f"BNOVO GET {path} status={r.status_code} {r.text[:150]}\n"); sys.stderr.flush()
+    except Exception as e:
+        sys.stderr.write(f"BNOVO GET {path} error: {e}\n"); sys.stderr.flush()
+    return None
+
+def phone_to_chat_id(phone):
+    """Телефон из брони -> WhatsApp chatId (только цифры, РФ-нормализация)."""
+    digits = re.sub(r'\D', '', phone or '')
+    if len(digits) == 11 and digits[0] == '8':
+        digits = '7' + digits[1:]
+    elif len(digits) == 10:
+        digits = '7' + digits
+    return digits if len(digits) == 11 else None
+
+def booking_already_confirmed(booking_id):
+    """Атомарно: True если этой брони уже слали подтверждение оплаты."""
+    conn = sqlite3.connect('chat_history.db', timeout=10)
+    c = conn.cursor()
+    try:
+        c.execute('INSERT INTO confirmed_bookings (booking_id, ts) VALUES (?, ?)', (str(booking_id), time.time()))
+        conn.commit()
+        done = False
+    except sqlite3.IntegrityError:
+        done = True
+    conn.close()
+    return done
+
+def process_bnovo_booking(booking_id):
+    """Пришёл вебхук об изменении брони — проверяем оплату и подтверждаем гостю."""
+    try:
+        booking = bnovo_get(f'/api/v1/bookings/{booking_id}')
+        if not booking:
+            return
+        status_id = (booking.get('status') or {}).get('id')
+        if status_id == 2:  # отменён — отмену ведёт человек, бот не вмешивается
+            return
+        paid = float(booking.get('payments_total') or 0)
+        if paid <= 0:
+            return  # оплаты ещё нет — ждём следующего вебхука
+        customer = booking.get('customer') or {}
+        chat_id = phone_to_chat_id(customer.get('phone'))
+        if not chat_id:
+            return
+        # Пишем только тем, кто реально общался с ботом (не чужие брони из Booking.com и т.п.)
+        if not get_history(chat_id):
+            sys.stderr.write(f"BNOVO booking {booking_id}: chat {chat_id} не наш — пропуск\n"); sys.stderr.flush()
+            return
+        if booking_already_confirmed(booking_id):
+            return  # уже подтверждали
+        send_wazzup_multi(chat_id, WAZZUP_CHANNEL_ID,
+                          "Оплата получена ✅ ||| Бронь подтверждена ||| Ждём вас, заезд с 14:00 🏔")
+        save_message(chat_id, "assistant", "Оплата получена, бронь подтверждена")
+        sys.stderr.write(f"BNOVO booking {booking_id} подтверждена гостю {chat_id}\n"); sys.stderr.flush()
+    except Exception as e:
+        sys.stderr.write(f"process_bnovo_booking error: {e}\n"); sys.stderr.flush()
+
 def find_alternatives(date_from, nights, today, max_days=10, max_options=2):
-    """Ищет ближайшие свободные даты той же длины (и до, и после запрошенных)."""
+    """Ищет ближайшие свободные даты той же длины (и до, и после запрошенных), только в сезоне."""
     options = []
     seen = set()
     base = datetime.strptime(date_from, '%Y-%m-%d')
@@ -187,6 +302,8 @@ def find_alternatives(date_from, nights, today, max_days=10, max_options=2):
         for direction in (1, -1):
             start = base + timedelta(days=shift * direction)
             if start.date() < today.date():
+                continue
+            if not in_season(start):  # не предлагаем даты вне сезона
                 continue
             sf = start.strftime('%Y-%m-%d')
             if sf in seen:
@@ -203,6 +320,9 @@ def find_alternatives(date_from, nights, today, max_days=10, max_options=2):
     return options
 
 def build_availability_context(date_from, date_to, today):
+    # Сезонный гейт — вне 28.04–28.09 в Bnovo не лезем
+    if not in_season(datetime.strptime(date_from, '%Y-%m-%d')):
+        return f"Даты {date_from} вне сезона. База работает с 28 апреля по 28 сентября (ежегодно). Заселение вне этого окна невозможно."
     data = check_availability_by_type(date_from, date_to)
     if data is None:
         return f"Данные о наличии недоступны на {date_from} - {date_to}."
@@ -234,11 +354,12 @@ SYSTEM_PROMPT = """АБСОЛЮТНЫЕ ЗАПРЕТЫ:
 
 СТИЛЬ (как живой менеджер):
 - Короткие сообщения через |||
+- Тёплая и приветливая, как настоящий человек, а не сухой автоответчик
 - Без "Отлично!", "С удовольствием!", "Замечательно!"
 - На простой вопрос — 2-5 слов
 - Один вопрос за раз
 - Цены формулой: 7500+7500=15 000
-- Эмодзи максимум одно за весь разговор
+- Эмодзи — умеренно и к месту, для живости и тепла (🙂 🏔 🌿 ✅). Не в каждом сообщении, но и не избегай — пара за разговор делает общение приятнее
 
 ПЕРВОЕ СООБЩЕНИЕ:
 Если история пустая — просто: Здравствуйте! ||| Чем могу помочь?
@@ -251,9 +372,17 @@ SYSTEM_PROMPT = """АБСОЛЮТНЫЕ ЗАПРЕТЫ:
 Не называй количество свободных номеров.
 Если на запрошенные даты всё занято, а в [BNOVO_DATA] есть "ближайшие свободные даты" — мягко предложи их клиенту как вариант. Например: "На эти даты всё занято ||| Но свободно с 14 по 17 июня — Лофт, A-Frame ||| Подойдёт?"
 Если свободных дат нет совсем — предложи позвонить Асели.
+Если в [BNOVO_DATA] сказано "вне сезона" — тепло объясни, что база работает только с 28 апреля по 28 сентября, и предложи выбрать даты в этом окне. Не извиняйся сухо, а по-доброму. Например: "Мы открыты с конца апреля по конец сентября 🏔 ||| На январь, к сожалению, не заселяем ||| Подобрать вам даты на лето?"
 
 СБОР ДАННЫХ для брони: даты, ночи, взрослые, дети и возраст, животные.
 Считай стоимость только когда знаешь всё.
+
+ССЫЛКА НА БРОНИРОВАНИЕ И ОПЛАТУ:
+Когда в контексте есть [BOOKING_LINK] и гость готов бронировать (сказал "бронируем", "да", "как оплатить", "оформляем") — дай ему эту ссылку. Через неё он сам подтвердит данные и оплатит онлайн, бронь сразу попадёт в систему.
+Не давай ссылку слишком рано — сначала подтверди даты, номер и цену, и только когда гость согласен — отправляй.
+Формулируй тепло, например: "Отлично! ||| Вот ссылка для брони и оплаты: [ссылка] ||| Там подтвердите данные и оплатите — место сразу закрепится за вами 🙂"
+Ссылку давай ровно как в [BOOKING_LINK], ничего не меняй в ней.
+После оплаты гость может прислать чек — поблагодари и скажи, что бронь подтверждена.
 
 ЗВОНИТЬ АСЕЛИ +7-913-693-68-19:
 - Группа 10+ человек — Позвоните — +7-913-693-68-19
@@ -380,6 +509,22 @@ def extract_nights(text):
         return 7
     return None
 
+def extract_adults(text):
+    """Сколько взрослых. None если не указано (по умолчанию подставим 2)."""
+    tl = text.lower()
+    if any(w in tl for w in ['на двоих', 'вдвоём', 'вдвоем', 'двое']):
+        return 2
+    if any(w in tl for w in ['одного', 'один человек', 'на одного', 'один взрослый']):
+        return 1
+    if any(w in tl for w in ['троих', 'трое']):
+        return 3
+    if any(w in tl for w in ['четверых', 'четверо']):
+        return 4
+    m = re.search(r'(\d{1,2})\s*(?:чел|человек|взросл|гост)', tl)
+    if m:
+        return max(1, int(m.group(1)))
+    return None
+
 def analyze_image(image_url):
     try:
         img_response = requests.get(image_url, timeout=10, verify=False)
@@ -439,6 +584,19 @@ def get_ai_response(user_message, chat_id):
             date_to = (datetime.strptime(date_from, '%Y-%m-%d') + timedelta(days=nights)).strftime('%Y-%m-%d')
         data_ctx = build_availability_context(date_from, date_to, datetime.now())
         bnovo_context = f"\n[BNOVO_DATA]: {data_ctx}"
+        # Ссылка на модуль бронирования (только в сезоне) — даём её, когда гость готов бронировать
+        if in_season(datetime.strptime(date_from, '%Y-%m-%d')):
+            adults = extract_adults(user_message)
+            if adults is None:
+                for h in reversed(history):
+                    if h['role'] == 'user':
+                        a = extract_adults(h['content'])
+                        if a:
+                            adults = a
+                            break
+            link = build_booking_link(date_from, date_to, adults or 2, phone=chat_id)
+            if link:
+                bnovo_context += f"\n[BOOKING_LINK]: {link}"
     sys.stderr.write(f"DEBUG dates={dates} | bnovo={bnovo_context[:150]}\n"); sys.stderr.flush()
     messages = history + [{"role": "user", "content": user_message + bnovo_context}]
     response = client.messages.create(
@@ -511,7 +669,7 @@ def process_wazzup_message(msg):
 
         # Аудио
         if msg_type in ("audio", "voice", "ptt"):
-            send_wazzup_message(chat_id, channel_id, "Голосовые не принимаю — напишите текстом")
+            send_wazzup_multi(chat_id, channel_id, "Ой, голосовые пока не могу прослушать 🙏 ||| Напишите, пожалуйста, текстом — сразу помогу")
             return
 
         # Фото от клиента
@@ -529,12 +687,12 @@ def process_wazzup_message(msg):
                     save_message(chat_id, "assistant", full_reply)
                     send_wazzup_multi(chat_id, channel_id, full_reply)
                 else:
-                    send_wazzup_message(chat_id, channel_id, "Фото получила, но не смогла открыть. Попробуйте ещё раз")
+                    send_wazzup_multi(chat_id, channel_id, "Фото получила, но не открылось 🙈 ||| Пришлите, пожалуйста, ещё разок")
             return
 
         # Документы, файлы, видео — НЕ запускаем флоу бронирования (иначе бот выдумывает из истории)
         if msg_type in ("document", "file", "video", "sticker", "location", "contact"):
-            send_wazzup_message(chat_id, channel_id, "Документ получила, передам Асели. По датам и бронированию — напишите, пожалуйста, текстом")
+            send_wazzup_multi(chat_id, channel_id, "Спасибо, получила! ||| Передам Асели 🙂 ||| А по датам и брони — напишите, пожалуйста, текстом")
             return
 
         text = msg.get("text", "")
@@ -601,6 +759,15 @@ def webhook():
         if text and chat_id:
             threading.Thread(target=process_max_message, args=(chat_id, text), daemon=True).start()
 
+    return "OK"
+
+@app.route("/bnovo-webhook", methods=["POST"])
+def bnovo_webhook():
+    data = request.get_json(silent=True) or {}
+    sys.stderr.write(f"BNOVO_WEBHOOK: {str(data)[:300]}\n"); sys.stderr.flush()
+    booking_ids = (data.get("data") or {}).get("booking_ids") or []
+    for bid in booking_ids:
+        threading.Thread(target=process_bnovo_booking, args=(bid,), daemon=True).start()
     return "OK"
 
 @app.route("/", methods=["GET"])
