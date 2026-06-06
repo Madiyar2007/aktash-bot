@@ -344,11 +344,12 @@ def send_wazzup_photo(chat_id, channel_id, image_url, caption=""):
         "channelId": channel_id,
         "chatId": chat_id,
         "chatType": "whatsapp",
-        "imageUrl": image_url,
+        "contentUri": image_url,
     }
     if caption:
         payload["text"] = caption
     r = requests.post(url, json=payload, headers=headers)
+    sys.stderr.write(f"PHOTO sent: {r.status_code} {image_url[-30:]}\n"); sys.stderr.flush()
     return r.status_code
 
 def send_room_photos(chat_id, channel_id, room_type):
@@ -395,6 +396,9 @@ def webhook():
         for msg in data.get("messages", []):
             sys.stderr.write(f"MSG status={msg.get('status')} text={msg.get('text','')[:50]}\n"); sys.stderr.flush()
             if msg.get("status") != "inbound":
+                continue
+            # Otvechaem TOLKO na lichnye chaty, ne gruppy
+            if msg.get("chatType") == "whatsgroup":
                 continue
             chat_id = msg.get("chatId", "")
             channel_id = msg.get("channelId", "")
