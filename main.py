@@ -29,6 +29,13 @@ BOOKING_MODULE_ID = "5c80b571-1fa1-4282-a76f-8ef53b8da612"
 # Канал Wazzup (для исходящих сообщений из вебхука Bnovo, где канала в запросе нет)
 WAZZUP_CHANNEL_ID = os.getenv("WAZZUP_CHANNEL_ID", "f2fb13af-f426-40ef-a3f0-f7c5f5bb3310")
 
+# Путь к БД. На Render укажи DB_PATH=/var/data/chat_history.db (примонтированный диск),
+# чтобы история и брони не терялись при деплое. Без переменной — локальный файл (эфемерный на Render).
+DB_PATH = os.getenv("DB_PATH", "chat_history.db")
+_db_dir = os.path.dirname(DB_PATH)
+if _db_dir:
+    os.makedirs(_db_dir, exist_ok=True)
+
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 
@@ -71,7 +78,7 @@ def detect_room_type(text):
     return None
 
 def init_db():
-    conn = sqlite3.connect('chat_history.db', timeout=10)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
     c = conn.cursor()
     c.execute('PRAGMA journal_mode=WAL')  # лучше переносит одновременную запись из потоков
     # FIX #4: явный автоинкрементный id — сортируем по нему, а не по timestamp (точность до секунды ломала порядок ролей)
@@ -89,7 +96,7 @@ def init_db():
     conn.close()
 
 def get_history(chat_id):
-    conn = sqlite3.connect('chat_history.db', timeout=10)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
     c = conn.cursor()
     # FIX #4: ORDER BY id (а не timestamp) — стабильный порядок вопрос/ответ
     c.execute('SELECT role, content FROM messages WHERE chat_id = ? ORDER BY id DESC LIMIT 20', (chat_id,))
@@ -99,7 +106,7 @@ def get_history(chat_id):
     return [{"role": row[0], "content": row[1]} for row in rows]
 
 def save_message(chat_id, role, content):
-    conn = sqlite3.connect('chat_history.db', timeout=10)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
     c = conn.cursor()
     c.execute('INSERT INTO messages (chat_id, role, content) VALUES (?, ?, ?)', (chat_id, role, content))
     conn.commit()
@@ -108,7 +115,7 @@ def save_message(chat_id, role, content):
 def already_processed(message_id):
     """FIX #5: True если это сообщение уже обрабатывали. Атомарно — решаем по факту INSERT, а не SELECT+INSERT."""
     now = time.time()
-    conn = sqlite3.connect('chat_history.db', timeout=10)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
     c = conn.cursor()
     c.execute('DELETE FROM seen_messages WHERE ts < ?', (now - 3600,))  # лёгкая чистка старого
     try:
@@ -253,7 +260,7 @@ def phone_to_chat_id(phone):
 
 def booking_already_confirmed(booking_id):
     """Атомарно: True если этой брони уже слали подтверждение оплаты."""
-    conn = sqlite3.connect('chat_history.db', timeout=10)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
     c = conn.cursor()
     try:
         c.execute('INSERT INTO confirmed_bookings (booking_id, ts) VALUES (?, ?)', (str(booking_id), time.time()))
@@ -378,10 +385,12 @@ SYSTEM_PROMPT = """АБСОЛЮТНЫЕ ЗАПРЕТЫ:
 Считай стоимость только когда знаешь всё.
 
 ССЫЛКА НА БРОНИРОВАНИЕ И ОПЛАТУ:
-Когда в контексте есть [BOOKING_LINK] и гость готов бронировать (сказал "бронируем", "да", "как оплатить", "оформляем") — дай ему эту ссылку. Через неё он сам подтвердит данные и оплатит онлайн, бронь сразу попадёт в систему.
-Не давай ссылку слишком рано — сначала подтверди даты, номер и цену, и только когда гость согласен — отправляй.
-Формулируй тепло, например: "Отлично! ||| Вот ссылка для брони и оплаты: [ссылка] ||| Там подтвердите данные и оплатите — место сразу закрепится за вами 🙂"
-Ссылку давай ровно как в [BOOKING_LINK], ничего не меняй в ней.
+Когда в контексте есть [BOOKING_LINK] и номер свободен — дай ссылку СРАЗУ вместе с ценой, в том же ответе. Не жди отдельного "да". Через ссылку гость сам введёт данные и оплатит онлайн, бронь сразу попадёт в систему.
+ФИО и телефон отдельно НЕ спрашивай — гость вводит их в форме по ссылке.
+Реквизиты карты НЕ давай — оплата только через ссылку.
+Ссылку вставляй ровно как в [BOOKING_LINK], ничего в ней не меняй.
+Пример: "Отлично, Лофт свободен 🙂 ||| 14-17 июня, 3 ночи — 22 500₽ ||| Забронировать и оплатить: [BOOKING_LINK] ||| Там подтвердите данные и оплатите — место сразу закрепится 🏔"
+Если [BOOKING_LINK] в контексте нет (даты не названы) — сначала уточни даты.
 После оплаты гость может прислать чек — поблагодари и скажи, что бронь подтверждена.
 
 ЗВОНИТЬ АСЕЛИ +7-913-693-68-19:
@@ -409,8 +418,7 @@ A-Frame: макс 6, до 1 июля 8000р после 8500р за 2, +300р, с
 БРОНИРОВАНИЕ:
 Заезд 14:00, выезд 12:00. Предоплата 50%.
 Отмена 7+ дней — штраф 10%, менее 7 дней — предоплата не возвращается.
-Для брони: ФИО, телефон, даты.
-Реквизиты: 89833275585 Бегенов Бекжан М. Сбербанк
+Бронь и оплата — только через ссылку [BOOKING_LINK]. ФИО, телефон и оплату гость вводит сам в форме. Отдельно реквизиты карты не давай.
 
 МЕСТО: Республика Алтай, Улаганский район, с. Акташ, ул. Лесная 1Б. Первая линия реки Чуя, горы вокруг.
 
