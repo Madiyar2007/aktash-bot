@@ -24,8 +24,7 @@ BNOVO_BASE_URL = 'https://api.pms.bnovo.ru'
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# Deduplikatsiya - ne otvechaem esli uzhe otvetili za poslednie 5 sekund
-last_response_time = {}
+
 
 GITHUB_PHOTOS = "https://raw.githubusercontent.com/Madiyar2007/aktash-bot/main/photos"
 
@@ -69,6 +68,8 @@ def init_db():
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS messages
                  (chat_id TEXT, role TEXT, content TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS dedup
+                 (chat_id TEXT PRIMARY KEY, last_time REAL)''')
     conn.commit()
     conn.close()
 
@@ -390,12 +391,19 @@ def webhook():
             if not text:
                 continue
 
-            # Deduplikatsiya - propuskaem esli otvetili menshe 5 sekund nazad
+            # Deduplikatsiya cherez SQLite
             now = time.time()
-            if chat_id in last_response_time and now - last_response_time[chat_id] < 5:
+            conn_d = sqlite3.connect('chat_history.db')
+            c_d = conn_d.cursor()
+            c_d.execute('SELECT last_time FROM dedup WHERE chat_id = ?', (chat_id,))
+            row = c_d.fetchone()
+            if row and now - row[0] < 5:
+                conn_d.close()
                 sys.stderr.write(f"SKIP duplicate for {chat_id}\n"); sys.stderr.flush()
                 continue
-            last_response_time[chat_id] = now
+            c_d.execute('INSERT OR REPLACE INTO dedup (chat_id, last_time) VALUES (?, ?)', (chat_id, now))
+            conn_d.commit()
+            conn_d.close()
 
             # Фото номеров по запросу
             room_type = detect_room_type(text)
