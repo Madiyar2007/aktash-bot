@@ -274,7 +274,7 @@ def analyze_image(image_url):
         image_data = base64.b64encode(img_response.content).decode('utf-8')
         content_type = img_response.headers.get('content-type', 'image/jpeg').split(';')[0]
         response = client.messages.create(
-            model="claude-sonnet-4-5",
+            model="claude-haiku-4-5-20251001",
             max_tokens=500,
             system=(
                 "Ty menedzher ekotelya Aktash Villadzh. Klient prislal foto.\n"
@@ -329,7 +329,7 @@ def get_ai_response(user_message, chat_id):
 
     messages = history + [{"role": "user", "content": user_message + bnovo_context}]
     response = client.messages.create(
-        model="claude-sonnet-4-5",
+        model="claude-haiku-4-5-20251001",
         max_tokens=1000,
         system=SYSTEM_PROMPT,
         messages=messages
