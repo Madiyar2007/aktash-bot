@@ -24,6 +24,9 @@ BNOVO_BASE_URL = 'https://api.pms.bnovo.ru'
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
+# Deduplikatsiya - ne otvechaem esli uzhe otvetili za poslednie 5 sekund
+last_response_time = {}
+
 GITHUB_PHOTOS = "https://raw.githubusercontent.com/Madiyar2007/aktash-bot/main/photos"
 
 ROOM_PHOTOS = {
@@ -258,7 +261,7 @@ def analyze_image(image_url):
         image_data = base64.b64encode(img_response.content).decode('utf-8')
         content_type = img_response.headers.get('content-type', 'image/jpeg').split(';')[0]
         response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model="claude-sonnet-4-5",
             max_tokens=500,
             system="Ты менеджер эко-отеля Акташ Вилладж. Клиент прислал фото. Определи что на фото: чек об оплате (извлеки сумму), паспорт (извлеки ФИО), или другое фото (опиши кратко). Отвечай коротко на русском.",
             messages=[{"role": "user", "content": [
@@ -290,7 +293,7 @@ def get_ai_response(user_message, chat_id):
     sys.stderr.write(f"DEBUG dates={dates} | bnovo={bnovo_context[:150]}\n"); sys.stderr.flush()
     messages = history + [{"role": "user", "content": user_message + bnovo_context}]
     response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
+        model="claude-sonnet-4-5",
         max_tokens=1000,
         system=SYSTEM_PROMPT,
         messages=messages
@@ -384,6 +387,13 @@ def webhook():
             text = msg.get("text", "")
             if not text:
                 continue
+
+            # Deduplikatsiya - propuskaem esli otvetili menshe 5 sekund nazad
+            now = time.time()
+            if chat_id in last_response_time and now - last_response_time[chat_id] < 5:
+                sys.stderr.write(f"SKIP duplicate for {chat_id}\n"); sys.stderr.flush()
+                continue
+            last_response_time[chat_id] = now
 
             # Фото номеров по запросу
             room_type = detect_room_type(text)
