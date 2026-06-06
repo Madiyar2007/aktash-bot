@@ -43,21 +43,21 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 GITHUB_PHOTOS = "https://raw.githubusercontent.com/Madiyar2007/aktash-bot/main/photos"
 
 ROOM_PHOTOS = {
-    "loft":     [f"{GITHUB_PHOTOS}/loft/{i}.jpg" for i in range(1, 4)],
-    "aframe":   [f"{GITHUB_PHOTOS}/aframe/{i}.jpg" for i in range(1, 7)],
-    "kottedzh": [f"{GITHUB_PHOTOS}/kottedzh/{i}.jpg" for i in range(1, 6)],
-    "modul":    [f"{GITHUB_PHOTOS}/modul/{i}.jpg" for i in range(1, 4)],
-    "domik":    [f"{GITHUB_PHOTOS}/domik/{i}.jpg" for i in range(1, 5)],
-    "standart": [f"{GITHUB_PHOTOS}/nomer_standart/{i}.jpg" for i in range(1, 3)],
+    "loft":     [f"{GITHUB_PHOTOS}/loft/{i}.jpg" for i in range(1, 5)],
+    "aframe":   [f"{GITHUB_PHOTOS}/aframe/{i}.jpg" for i in range(1, 9)],
+    "kottedzh": [f"{GITHUB_PHOTOS}/kottedzh/{i}.jpg" for i in range(1, 7)],
+    "modul":    [f"{GITHUB_PHOTOS}/modul/{i}.jpg" for i in range(1, 5)],
+    "domik":    [f"{GITHUB_PHOTOS}/domik/{i}.jpg" for i in range(1, 6)],
+    "standart": [f"{GITHUB_PHOTOS}/nomer_standart/{i}.jpg" for i in range(1, 4)],
 }
 
 ROOM_KEYWORDS = {
     "loft":     ["лофт"],
-    "aframe":   ["a-frame", "афрейм", "а-фрейм", "aframe"],
+    "aframe":   ["a-frame", "афрейм", "а-фрейм", "aframe", "эй-фрейм"],
     "kottedzh": ["коттедж"],
-    "modul":    ["модуль", "модульный"],
-    "domik":    ["домик стандарт", "стандартный домик"],
-    "standart": ["номер стандарт", "стандартный номер"],
+    "modul":    ["модул"],
+    "domik":    ["домик стандарт", "стандартный домик", "стандарт домик"],
+    "standart": ["номер стандарт", "стандартный номер", "стандарт номер"],
 }
 
 ROOM_TYPES = {
@@ -442,7 +442,8 @@ SYSTEM_PROMPT = """Ты — Асель, менеджер эко-отеля «А�
 Можно. 500₽/день, оплата на месте при заезде. Паспорт здоровья показать на месте. Добавляй 500₽/день к расчёту, если гость с животным.
 
 ФОТО:
-Если просишь показать или предлагаешь — система отправит фото сама, тебе не нужно ничего делать с фото, просто продолжай разговор.
+Когда гость просит фото или ты предлагаешь номер — просто тепло опиши номер словами. Фото отправит система сама, тебе ничего делать с фото не нужно.
+НИКОГДА не пиши служебных фраз вроде «фотографии автоматически отправлены», «отправляю фото», «сейчас отправлю фото», «фото отправлены». Это внутренняя механика, гостю её видеть нельзя. Просто говори про номер по-человечески, как будто фото уже видно.
 
 ЗВОНИТЬ АСЕЛИ +7-913-693-68-19:
 - Группа 10+ человек, жалоба/конфликт, договор/счёт для организации, проблема при заезде.
