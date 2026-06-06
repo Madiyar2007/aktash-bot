@@ -1,3 +1,4 @@
+import sys
 from flask import Flask, request
 import requests
 import anthropic
@@ -212,7 +213,7 @@ def get_ai_response(user_message, chat_id):
         data = check_availability_by_type(date_from, date_to)
         bnovo_context = f"\n[BNOVO_DATA]: {format_availability(data, date_from, date_to)}"
 
-    print(f"DEBUG dates={dates} | bnovo={bnovo_context[:150]}")
+    sys.stderr.write(f"DEBUG dates={dates} | bnovo={bnovo_context[:150]}\n"); sys.stderr.flush()
 
     messages = history + [{"role": "user", "content": user_message + bnovo_context}]
     response = client.messages.create(
@@ -237,7 +238,7 @@ def send_wazzup_multi(chat_id, channel_id, full_text):
         time.sleep(min(len(part) * 0.04, 2.5))
         send_wazzup_message(chat_id, channel_id, part)
         time.sleep(0.4)
-    print("Wazzup: otpravleno", len(parts), "soobshcheniy")
+    sys.stderr.write(f"Wazzup: otpravleno {len(parts)} soobshcheniy\n"); sys.stderr.flush()
 
 def send_max_message(chat_id, text):
     url = "https://botapi.max.ru/messages"
@@ -257,10 +258,10 @@ def webhook():
     data = request.json
     if not data:
         return "OK"
-    print(f"WEBHOOK: {str(data)[:300]}")
+    sys.stderr.write(f"WEBHOOK: {str(data)[:300]}\n"); sys.stderr.flush()
     if "messages" in data:
         for msg in data.get("messages", []):
-            print(f"MSG status={msg.get('status')} text={msg.get('text','')[:50]}")
+            sys.stderr.write(f"MSG status={msg.get('status')} text={msg.get('text','')[:50]}\n"); sys.stderr.flush()
             if msg.get("status") != "inbound":
                 continue
             text = msg.get("text", "")
