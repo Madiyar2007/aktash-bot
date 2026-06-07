@@ -19,6 +19,7 @@ app = Flask(__name__)
 MAX_TOKEN = os.getenv("MAX_TOKEN")
 WAZZUP_API_KEY = os.getenv("WAZZUP_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # для распознавания голосовых (Whisper)
 BNOVO_PASSWORD = os.getenv("BNOVO_PASSWORD")
 BNOVO_USER_ID = 118966
 BNOVO_BASE_URL = 'https://api.pms.bnovo.ru'
@@ -699,6 +700,37 @@ def extract_children(text):
         sys.stderr.write(f"Image error: {e}\n")
         return None
 
+def transcribe_audio(audio_url):
+    """Скачивает голосовое и распознаёт речь через OpenAI Whisper. Возвращает текст или None."""
+    if not OPENAI_API_KEY:
+        sys.stderr.write("transcribe: нет OPENAI_API_KEY\n"); sys.stderr.flush()
+        return None
+    try:
+        audio = requests.get(audio_url, timeout=20, verify=False)
+        if audio.status_code != 200:
+            sys.stderr.write(f"transcribe: аудио не скачалось {audio.status_code}\n"); sys.stderr.flush()
+            return None
+        # Имя файла с расширением — Whisper определяет формат по нему (ogg для WhatsApp)
+        fname = audio_url.split("?")[0].split("/")[-1] or "voice.ogg"
+        if "." not in fname:
+            fname += ".ogg"
+        r = requests.post(
+            "https://api.openai.com/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            files={"file": (fname, audio.content)},
+            data={"model": "whisper-1", "language": "ru"},
+            timeout=60
+        )
+        if r.status_code == 200:
+            text = (r.json().get("text") or "").strip()
+            sys.stderr.write(f"transcribe OK: {text[:80]}\n"); sys.stderr.flush()
+            return text or None
+        sys.stderr.write(f"transcribe error {r.status_code}: {r.text[:150]}\n"); sys.stderr.flush()
+        return None
+    except Exception as e:
+        sys.stderr.write(f"transcribe error: {e}\n"); sys.stderr.flush()
+        return None
+
 AVAIL_KW = ["свобод", "есть ли", "можно", "можете", "забронир", "брон", "заезд",
             "засел", "размест", "ноч", "чел", "человек", "мест", "приед",
             "остановит", "номер", "дата", "числ", "взросл", "детей", "ребён",
@@ -891,6 +923,11 @@ def flush_chat(chat_id):
             mt = msg.get("type", "text")
             if mt in ("audio", "voice", "ptt"):
                 has_audio = True
+                url = msg.get("contentUri") or msg.get("fileUrl") or msg.get("url", "")
+                if url:
+                    spoken = transcribe_audio(url)
+                    if spoken:
+                        texts.append(spoken)  # распознанная речь идёт как обычный текст
             elif mt in ("image", "photo"):
                 url = msg.get("fileUrl") or msg.get("url") or msg.get("imageUrl", "")
                 if url:
@@ -916,10 +953,10 @@ def flush_chat(chat_id):
 
         combined = " ".join(texts).strip()
 
-        # Только голос и больше ничего
+        # Голос пришёл, но распознать не удалось (или пустой)
         if not combined and not photo_descs:
             if has_audio:
-                send_wazzup_multi(chat_id, channel_id, "Ой, голосовые пока не могу прослушать 🙏 ||| Напишите, пожалуйста, текстом — сразу помогу", chat_type)
+                send_wazzup_multi(chat_id, channel_id, "Ой, не расслышала голосовое 🙏 ||| Повторите или напишите текстом — сразу помогу", chat_type)
             return
 
         # Тип номера: из текста, из цитаты, или с присланной карточки/фото
