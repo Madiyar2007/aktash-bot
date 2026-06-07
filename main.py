@@ -277,9 +277,10 @@ def in_season(d):
     before_end = (d.month, d.day) <= (9, 28)
     return after_start and before_end
 
-def build_booking_link(date_from, date_to, adults=2, phone=None):
+def build_booking_link(date_from, date_to, adults=2, phone=None, children=None):
     """Ссылка на модуль бронирования с предзаполненными датами и гостями.
-    date_from/date_to приходят как ГГГГ-ММ-ДД, модуль ждёт ДД-ММ-ГГГГ."""
+    date_from/date_to приходят как ГГГГ-ММ-ДД, модуль ждёт ДД-ММ-ГГГГ.
+    children — список возрастов детей, например [4, 6]."""
     try:
         df = datetime.strptime(date_from, '%Y-%m-%d').strftime('%d-%m-%Y')
         dt = datetime.strptime(date_to, '%Y-%m-%d').strftime('%d-%m-%Y')
@@ -289,6 +290,9 @@ def build_booking_link(date_from, date_to, adults=2, phone=None):
     url = (f"https://reservationsteps.ru/rooms/index/{BOOKING_MODULE_ID}"
            f"?lang=ru&scroll_to_rooms=1&is_auto_search=1"
            f"&dfrom={df}&dto={dt}&adults={adults}")
+    if children:  # дети: children=[4,6] в URL-кодировке -> %5B4%2C6%5D
+        ages = ",".join(str(int(a)) for a in children)
+        url += f"&children=%5B{ages.replace(',', '%2C')}%5D"
     if phone:  # предзаполняем телефон гостя — так бронь сматчится с его WhatsApp
         url += f"&phone={phone}"
     return url
@@ -523,7 +527,11 @@ SYSTEM_PROMPT = """Ты — Асель, менеджер эко-отеля «А�
 Ссылку вставляй ровно как в [BOOKING_LINK], ничего не меняй.
 Пример (один номер): «Лофт свободен 🤗 ||| 14-17 июня, 3 ночи — 22 500₽ ||| Забронировать и оплатить: [BOOKING_LINK] ||| Там подтвердите данные и оплатите 🏔»
 Если [BOOKING_LINK] нет (даты не названы) — сначала уточни даты.
-После оплаты гость может прислать чек — поблагодари, скажи что бронь подтверждена.
+ОПЛАТА — НИКОГДА НЕ ПОДТВЕРЖДАЙ НА СЛОВО:
+Ты НЕ подтверждаешь оплату сам. Подтверждение приходит АВТОМАТИЧЕСКИ от системы, когда деньги реально поступили — отдельным сообщением «Оплата получена ✅».
+Если гость пишет «я оплатил», «оплата прошла», «подтвердите» или присылает чек/скриншот — НЕ говори «бронь подтверждена», «оплата получена», «всё готово». Гость может ошибиться или обмануть, а ты денег не видишь.
+Отвечай мягко и нейтрально: «Спасибо! ||| Как оплата пройдёт в системе — сразу подтвержу бронь 🤗» или «Принято, проверю поступление и подтвержу». Без утверждений, что деньги уже пришли.
+Только система (по факту реальной оплаты) присылает «Оплата получена ✅ бронь подтверждена». Ты этого сам не пишешь никогда.
 
 СОБАКА / ЖИВОТНЫЕ:
 Можно. 500₽ за одну собаку за СУТКИ (за каждую ночь, за каждую собаку). Оплата на месте при заезде, паспорт здоровья показать на месте.
@@ -649,7 +657,21 @@ def extract_adults(text):
         return max(1, int(m.group(1)))
     return None
 
-def analyze_image(image_url):
+def extract_children(text):
+    """Возрасты детей из сообщения -> список чисел. 'дети 4 и 6 лет' -> [4, 6].
+    Отсекает даты (14-17 июня), берёт только числа рядом со словом про детей."""
+    tl = text.lower()
+    m = re.search(r'(ребён|ребен|дет|малыш|сын|доч)', tl)
+    if not m:
+        return []
+    # Берём кусок текста ОТ слова про детей (даты обычно идут до/после отдельно)
+    seg = tl[m.start(): m.start() + 60]
+    # Обрезаем на названии месяца — чтобы не схватить дату вида "14-17 июня"
+    seg = re.split(r'(январ|феврал|март|апрел|ма[йя]|июн|июл|август|сентябр|октябр|ноябр|декабр)', seg)[0]
+    # Убираем диапазоны-даты вида 14-17
+    seg = re.sub(r'\d{1,2}\s*[-–—]\s*\d{1,2}', ' ', seg)
+    ages = [int(n) for n in re.findall(r'\d{1,2}', seg)]
+    return [a for a in ages if 0 <= a <= 17]
     try:
         img_response = requests.get(image_url, timeout=10, verify=False)
         if img_response.status_code != 200:
@@ -728,7 +750,16 @@ def get_ai_response(user_message, chat_id):
                         if a:
                             adults = a
                             break
-            link = build_booking_link(date_from, date_to, adults or 2, phone=chat_id)
+            # Дети: ищем возрасты в текущем сообщении, иначе в истории
+            children = extract_children(user_message)
+            if not children:
+                for h in reversed(history):
+                    if h['role'] == 'user':
+                        c = extract_children(h['content'])
+                        if c:
+                            children = c
+                            break
+            link = build_booking_link(date_from, date_to, adults or 2, phone=chat_id, children=children)
             if link:
                 bnovo_context += f"\n[BOOKING_LINK]: {link}"
     sys.stderr.write(f"DEBUG dates={dates} | bnovo={bnovo_context[:150]}\n"); sys.stderr.flush()
