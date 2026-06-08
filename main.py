@@ -75,82 +75,91 @@ ROOM_TYPES = {
     747057: "Номер Стандарт",
 }
 
-# ---- Расчёт цены (детерминированный, чтобы модель не считала сама) ----
-# Тарифы строго из бизнес-правил отеля. Если что-то изменится — правится ТОЛЬКО здесь.
-#  - граница 1 июля считается ПОНОЧНО (каждая ночь по своей дате)
-#  - Коттедж без сезонного подъёма (подтверждено владельцем)
-#  - доплата за доп. место фиксированная, сезонной делается только базовый тариф
-RATES = {
-    "standart": {"name": "Номер Стандарт",    "base": 5000, "seasonal": False, "extra": 500, "max": 3},
-    "domik":    {"name": "Стандарт домик",     "base": 5500, "seasonal": False, "extra": 500, "max": 3},
-    "kottedzh": {"name": "Коттедж с террасой", "base": 6500, "seasonal": False, "extra": 300, "max": 4},
-    "loft":     {"name": "Лофт",    "low": 7500, "high": 7800, "seasonal": True, "extra": 300, "max": 4},
-    "modul":    {"name": "Модуль",  "low": 7500, "high": 7800, "seasonal": True, "extra": 300, "max": 4},
-    "aframe":   {"name": "A-Frame", "low": 8000, "high": 8500, "seasonal": True, "extra": 0,   "max": 6, "flat": True},
-}
-# Названия из Bnovo (free_room_types) -> ключи тарифов
-NAME_TO_KEY = {
-    "Модуль": "modul", "Лофт": "loft", "A-Frame": "aframe",
-    "Домик Стандарт": "domik", "Стандарт домик": "domik",
-    "Коттедж с террасой": "kottedzh", "Номер Стандарт": "standart",
-}
-DOG_PER_NIGHT = 500
+# ---- Цены берём НАПРЯМУЮ из Bnovo (тариф «Стандартный»), чтобы они совпадали со страницей оплаты ----
+# В этом отеле цена за номер фиксированная (не зависит от числа гостей) — так настроено в Bnovo.
+NAME_TO_TYPEID = {v: k for k, v in ROOM_TYPES.items()}   # имя типа -> id типа
+_bnovo_plan = {"id": None}
 
-def _nightly_base(room, night_day):
-    """Базовый тариф за конкретную ночь (поночный сезон: до 1 июля низкий, с 1 июля высокий)."""
-    if not room.get("seasonal"):
-        return room["base"]
-    return room["low"] if night_day < date(night_day.year, 7, 1) else room["high"]
+def _rub(n):
+    return f"{int(round(n)):,}".replace(",", " ") + "₽"
 
-def room_price(room_key, date_from, date_to, guests):
-    """Стоимость проживания ОДНОГО номера. guests — гости в этом номере (дети до 5 не считать).
-    Возвращает сумму в рублях или None, если номер не вмещает столько гостей."""
-    room = RATES.get(room_key)
-    if not room:
-        return None
+def get_tariff_plan_id():
+    """ID тарифного плана Bnovo. Берём из env BNOVO_PLAN_ID или из /api/v1/tariffs (родительский/первый). Кэшируем."""
+    if _bnovo_plan["id"] is not None:
+        return _bnovo_plan["id"]
+    env_id = os.getenv("BNOVO_PLAN_ID")
+    if env_id:
+        try:
+            _bnovo_plan["id"] = int(env_id)
+            return _bnovo_plan["id"]
+        except ValueError:
+            pass
+    data = bnovo_get("/api/v1/tariffs")
+    plans = (data or {}).get("plans") or []
+    if plans:
+        chosen = next((p for p in plans if p.get("parent_id") == 0), plans[0])
+        _bnovo_plan["id"] = chosen.get("id")
+    return _bnovo_plan["id"]
+
+def fetch_room_prices(date_from, date_to):
+    """Реальная цена за номер за период из Bnovo. Возвращает {type_id(int): сумма за все ночи} или {}.
+    Суммируем только ночи (даты с заезда по выезд, не включая дату выезда)."""
+    plan = get_tariff_plan_id()
+    if not plan:
+        return {}
     try:
         d0 = datetime.strptime(date_from, "%Y-%m-%d").date()
         d1 = datetime.strptime(date_to, "%Y-%m-%d").date()
     except (ValueError, TypeError):
-        return None
-    nights = (d1 - d0).days
-    if nights < 1 or guests > room["max"]:
-        return None
-    extra = (0 if room.get("flat") else max(0, guests - 2)) * room["extra"]
-    return sum(_nightly_base(room, d0 + timedelta(days=i)) + extra for i in range(nights))
-
-def _rub(n):
-    return f"{n:,}".replace(",", " ") + "₽"
+        return {}
+    night_dates = set()
+    cur = d0
+    while cur < d1:
+        night_dates.add(cur.strftime("%Y-%m-%d"))
+        cur += timedelta(days=1)
+    if not night_dates:
+        return {}
+    data = bnovo_get(f"/api/v1/tariffs/prices/{plan}?date_from={date_from}&date_to={date_to}")
+    prices = (data or {}).get("prices") or {}
+    totals = {}
+    for tid_str, per_date in prices.items():
+        try:
+            tid = int(tid_str)
+        except (ValueError, TypeError):
+            continue
+        s, ok = 0, False
+        for dstr, pinfo in (per_date or {}).items():
+            if dstr in night_dates and isinstance(pinfo, dict) and isinstance(pinfo.get("price"), (int, float)):
+                s += pinfo["price"]
+                ok = True
+        if ok:
+            totals[tid] = s
+    return totals
 
 def build_price_block(date_from, date_to, free_names):
-    """Готовые суммы проживания по СВОБОДНЫМ номерам на нужные даты — чтобы модель не считала сама.
-    free_names — список названий из free_room_types. Возвращает текст блока [PRICES] или ''."""
+    """Блок [PRICES] с РЕАЛЬНЫМИ ценами Bnovo по свободным номерам. Цена за номер фиксированная.
+    Возвращает текст или '' (если цены недоступны — тогда бот не называет сумму, а уточняет)."""
+    totals = fetch_room_prices(date_from, date_to)
+    if not totals:
+        return ""
     try:
         nights = (datetime.strptime(date_to, "%Y-%m-%d").date()
                   - datetime.strptime(date_from, "%Y-%m-%d").date()).days
     except (ValueError, TypeError):
         return ""
-    if nights < 1:
-        return ""
     seen, lines = set(), []
     for nm in free_names:
-        key = NAME_TO_KEY.get(nm)
-        if not key or key in seen:
+        tid = NAME_TO_TYPEID.get(nm)
+        if tid is None or tid in seen:
             continue
-        seen.add(key)
-        room = RATES[key]
-        if room.get("flat"):
-            lines.append(f"{room['name']}: до {room['max']} чел {_rub(room_price(key, date_from, date_to, room['max']))}")
-        else:
-            parts = []
-            for o in range(2, room["max"] + 1):
-                label = "1-2 чел" if o == 2 else f"{o} чел"
-                parts.append(f"{label} {_rub(room_price(key, date_from, date_to, o))}")
-            lines.append(f"{room['name']}: " + ", ".join(parts))
+        seen.add(tid)
+        if tid in totals:
+            lines.append(f"{nm}: {_rub(totals[tid])} за {nights} ноч.")
     if not lines:
         return ""
-    return ("[PRICES] за " + str(nights) + " ночей (готовые суммы проживания, НЕ считай сам; "
-            "для комбинации номеров сложи их суммы):\n" + "\n".join(lines))
+    return ("[PRICES] реальные цены Bnovo за " + str(nights) + " ночей. Цена за НОМЕР фиксированная "
+            "(не зависит от числа гостей). НЕ считай сам. Один номер — назови сумму; "
+            "комбинация номеров — сложи их суммы:\n" + "\n".join(lines))
 
 
 def detect_room_type(text):
@@ -182,6 +191,9 @@ def init_db():
     # Пауза бота по чату (ручной режим, когда диалог ведёт Асель сама)
     c.execute('''CREATE TABLE IF NOT EXISTS chat_pause
                  (chat_id TEXT PRIMARY KEY, paused_until REAL, ts REAL)''')
+    # Навсегда отключённые чаты (личные контакты/друзья) — бот туда не пишет никогда
+    c.execute('''CREATE TABLE IF NOT EXISTS disabled_chats
+                 (chat_id TEXT PRIMARY KEY, ts REAL)''')
     conn.commit()
     conn.close()
 
@@ -298,9 +310,44 @@ def was_sent_by_bot(text):
     with _bot_sent_lock:
         return n in _bot_sent_texts
 
+_disabled_db = set()   # навсегда отключённые чаты из БД (кэш в памяти)
+
+def load_disabled_chats():
+    """Загружаем постоянно отключённые чаты из БД в память (при старте)."""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=10)
+        c = conn.cursor()
+        c.execute('SELECT chat_id FROM disabled_chats')
+        _disabled_db.clear()
+        _disabled_db.update(r[0] for r in c.fetchall())
+        conn.close()
+    except Exception as e:
+        sys.stderr.write(f"load_disabled_chats error: {e}\n"); sys.stderr.flush()
+
 def is_bot_disabled(chat_id):
-    """Чат из постоянного стоп-листа (env BOT_DISABLED_CHATS) — бот не пишет туда никогда."""
-    return chat_id in BOT_DISABLED_CHATS
+    """Чат, где бот не пишет НИКОГДА: либо в env-списке BOT_DISABLED_CHATS, либо отключён вручную (БД).
+    Сюда вносим личные контакты и друзей, чтобы бот не лез в личную переписку."""
+    return chat_id in BOT_DISABLED_CHATS or chat_id in _disabled_db
+
+def disable_chat(chat_id):
+    """Навсегда отключить бота в этом чате (личный контакт/друг)."""
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    c = conn.cursor()
+    c.execute('INSERT OR REPLACE INTO disabled_chats (chat_id, ts) VALUES (?, ?)', (chat_id, time.time()))
+    conn.commit()
+    conn.close()
+    _disabled_db.add(chat_id)
+
+def enable_chat(chat_id):
+    """Вернуть бота в чат, ранее отключённый вручную."""
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    c = conn.cursor()
+    c.execute('DELETE FROM disabled_chats WHERE chat_id = ?', (chat_id,))
+    conn.commit()
+    conn.close()
+    _disabled_db.discard(chat_id)
+
+load_disabled_chats()
 
 def pause_chat(chat_id, hours=None):
     """Ставим чат на паузу: бот молчит, диалог ведёт человек. Пауза скользящая — каждое сообщение оператора её продлевает."""
@@ -654,19 +701,18 @@ SYSTEM_PROMPT = """Ты — Асель, менеджер эко-отеля «А�
 ДОМИКИ (отдельные, живёте одни): Модуль, A-Frame, Стандарт домик.
 
 ЦЕНЫ — БЕРИ ТОЛЬКО ИЗ БЛОКА [PRICES]:
-В данных приходит блок [PRICES] с уже посчитанными суммами проживания по свободным номерам на нужные даты и число ночей.
-- НИКОГДА не считай сам: ни базу, ни доплату за доп. место, ни умножение на ночи. Все суммы уже готовы в [PRICES].
-- Один номер: назови сумму из [PRICES] для нужного числа гостей (например «Лофт на 3» — бери строку «3 чел»).
-- Несколько номеров (группа): сложи готовые суммы выбранных номеров из [PRICES]. Например Лофт (4) + Модуль (3) — возьми обе суммы из [PRICES] и сложи их.
-- Ребёнок до 5 лет в число гостей НЕ входит, от 5 лет считается как гость (бери строку на соответствующее число).
-- Если блока [PRICES] в данных нет — значит не хватает дат или числа гостей. Сначала уточни их, цену не называй.
-- Никаких формул гостю («7800×3»). Только итоговая сумма.
+В данных приходит блок [PRICES] с реальными ценами Bnovo по свободным номерам на нужные даты. Цена за НОМЕР фиксированная — она НЕ зависит от числа гостей, доплат за доп. место нет.
+- НИКОГДА не считай сам. Все суммы уже готовы в [PRICES].
+- Один номер: назови его сумму из [PRICES].
+- Несколько номеров (группа): сложи суммы выбранных номеров из [PRICES]. Например Лофт + Стандарт домик — возьми обе суммы и сложи их.
+- Если блока [PRICES] в данных нет — значит цены сейчас недоступны или не хватает дат. НЕ называй сумму: скажи «сейчас уточню стоимость» или попроси даты.
+- Никаких формул гостю. Только итоговая сумма.
 
 ОСОБЕННОСТИ НОМЕРОВ (не про цену): Номер Стандарт без холодильника. Коттедж и Лофт двухэтажные. A-Frame самый вместительный, до 6 человек.
 
 ДЕТИ:
 До 5 лет — бесплатно, не занимают место и не считаются в вместимость.
-От 5 лет — считается как взрослый: занимает место и оплачивается как доп. человек (для [PRICES] бери строку на это число гостей).
+От 5 лет — считается как гость для ВМЕСТИМОСТИ (влияет, влезут ли в номер). На цену не влияет: цена за номер фиксированная.
 
 ВМЕСТИМОСТЬ И БОЛЬШИЕ ГРУППЫ (важно — не ленись с вариантами):
 Вместимость: Стандарты — до 3, Лофт/Коттедж/Модуль — до 4, A-Frame — до 6.
@@ -1398,17 +1444,28 @@ def index():
 
 @app.route("/admin/bot", methods=["GET", "POST"])
 def admin_bot():
-    """Ручное управление паузой бота по чату (нужен ADMIN_TOKEN в env).
+    """Ручное управление ботом по чату (нужен ADMIN_TOKEN в env).
     Примеры:
-      /admin/bot?token=XXX&chat_id=79991234567&action=pause&hours=24
+      /admin/bot?token=XXX&chat_id=79991234567&action=disable   (навсегда заглушить — друзья/личка)
+      /admin/bot?token=XXX&chat_id=79991234567&action=enable    (вернуть бота в чат)
+      /admin/bot?token=XXX&chat_id=79991234567&action=pause&hours=24   (временная пауза)
       /admin/bot?token=XXX&chat_id=79991234567&action=resume
-      /admin/bot?token=XXX&chat_id=79991234567   (просто статус)"""
+      /admin/bot?token=XXX&action=list                          (список отключённых чатов)
+      /admin/bot?token=XXX&chat_id=79991234567                  (статус чата)"""
     if not ADMIN_TOKEN or request.args.get("token") != ADMIN_TOKEN:
         return {"error": "unauthorized"}, 401
+    action = request.args.get("action", "status")
+    if action == "list":
+        return {"disabled_env": sorted(BOT_DISABLED_CHATS), "disabled_manual": sorted(_disabled_db)}
     chat_id = request.args.get("chat_id", "")
     if not chat_id:
         return {"error": "chat_id required"}, 400
-    action = request.args.get("action", "status")
+    if action == "disable":
+        disable_chat(chat_id)
+        return {"chat_id": chat_id, "disabled": True}
+    if action == "enable":
+        enable_chat(chat_id)
+        return {"chat_id": chat_id, "disabled": False}
     if action == "pause":
         hours = float(request.args.get("hours", HANDOVER_PAUSE_HOURS))
         pause_chat(chat_id, hours)
