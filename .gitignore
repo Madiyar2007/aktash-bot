@@ -1,3 +1,5 @@
-.env
-files.zip
-*.zip
+__pycache__/ 
+*.db 
+.env 
+cd 
+python 
