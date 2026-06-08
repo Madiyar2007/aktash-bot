@@ -7,7 +7,7 @@ import sqlite3
 import time
 import re
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from dotenv import load_dotenv
 import urllib3
 urllib3.disable_warnings()
@@ -29,6 +29,11 @@ BOOKING_MODULE_ID = "5c80b571-1fa1-4282-a76f-8ef53b8da612"
 
 # Канал Wazzup (для исходящих сообщений из вебхука Bnovo, где канала в запросе нет)
 WAZZUP_CHANNEL_ID = os.getenv("WAZZUP_CHANNEL_ID", "f2fb13af-f426-40ef-a3f0-f7c5f5bb3310")
+
+# Ручной режим / пауза бота по чатам
+HANDOVER_PAUSE_HOURS = float(os.getenv("HANDOVER_PAUSE_HOURS", "24"))  # на сколько бот замолкает после ручного сообщения оператора (скользящая пауза)
+BOT_DISABLED_CHATS = {c.strip() for c in os.getenv("BOT_DISABLED_CHATS", "").split(",") if c.strip()}  # чаты, где бот не работает никогда
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")  # токен для ручки /admin/bot (без него ручка выключена)
 
 # Путь к БД. На Render укажи DB_PATH=/var/data/chat_history.db (примонтированный диск),
 # чтобы история и брони не терялись при деплое. Без переменной — локальный файл (эфемерный на Render).
@@ -70,6 +75,84 @@ ROOM_TYPES = {
     747057: "Номер Стандарт",
 }
 
+# ---- Расчёт цены (детерминированный, чтобы модель не считала сама) ----
+# Тарифы строго из бизнес-правил отеля. Если что-то изменится — правится ТОЛЬКО здесь.
+#  - граница 1 июля считается ПОНОЧНО (каждая ночь по своей дате)
+#  - Коттедж без сезонного подъёма (подтверждено владельцем)
+#  - доплата за доп. место фиксированная, сезонной делается только базовый тариф
+RATES = {
+    "standart": {"name": "Номер Стандарт",    "base": 5000, "seasonal": False, "extra": 500, "max": 3},
+    "domik":    {"name": "Стандарт домик",     "base": 5500, "seasonal": False, "extra": 500, "max": 3},
+    "kottedzh": {"name": "Коттедж с террасой", "base": 6500, "seasonal": False, "extra": 300, "max": 4},
+    "loft":     {"name": "Лофт",    "low": 7500, "high": 7800, "seasonal": True, "extra": 300, "max": 4},
+    "modul":    {"name": "Модуль",  "low": 7500, "high": 7800, "seasonal": True, "extra": 300, "max": 4},
+    "aframe":   {"name": "A-Frame", "low": 8000, "high": 8500, "seasonal": True, "extra": 0,   "max": 6, "flat": True},
+}
+# Названия из Bnovo (free_room_types) -> ключи тарифов
+NAME_TO_KEY = {
+    "Модуль": "modul", "Лофт": "loft", "A-Frame": "aframe",
+    "Домик Стандарт": "domik", "Стандарт домик": "domik",
+    "Коттедж с террасой": "kottedzh", "Номер Стандарт": "standart",
+}
+DOG_PER_NIGHT = 500
+
+def _nightly_base(room, night_day):
+    """Базовый тариф за конкретную ночь (поночный сезон: до 1 июля низкий, с 1 июля высокий)."""
+    if not room.get("seasonal"):
+        return room["base"]
+    return room["low"] if night_day < date(night_day.year, 7, 1) else room["high"]
+
+def room_price(room_key, date_from, date_to, guests):
+    """Стоимость проживания ОДНОГО номера. guests — гости в этом номере (дети до 5 не считать).
+    Возвращает сумму в рублях или None, если номер не вмещает столько гостей."""
+    room = RATES.get(room_key)
+    if not room:
+        return None
+    try:
+        d0 = datetime.strptime(date_from, "%Y-%m-%d").date()
+        d1 = datetime.strptime(date_to, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
+    nights = (d1 - d0).days
+    if nights < 1 or guests > room["max"]:
+        return None
+    extra = (0 if room.get("flat") else max(0, guests - 2)) * room["extra"]
+    return sum(_nightly_base(room, d0 + timedelta(days=i)) + extra for i in range(nights))
+
+def _rub(n):
+    return f"{n:,}".replace(",", " ") + "₽"
+
+def build_price_block(date_from, date_to, free_names):
+    """Готовые суммы проживания по СВОБОДНЫМ номерам на нужные даты — чтобы модель не считала сама.
+    free_names — список названий из free_room_types. Возвращает текст блока [PRICES] или ''."""
+    try:
+        nights = (datetime.strptime(date_to, "%Y-%m-%d").date()
+                  - datetime.strptime(date_from, "%Y-%m-%d").date()).days
+    except (ValueError, TypeError):
+        return ""
+    if nights < 1:
+        return ""
+    seen, lines = set(), []
+    for nm in free_names:
+        key = NAME_TO_KEY.get(nm)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        room = RATES[key]
+        if room.get("flat"):
+            lines.append(f"{room['name']}: до {room['max']} чел {_rub(room_price(key, date_from, date_to, room['max']))}")
+        else:
+            parts = []
+            for o in range(2, room["max"] + 1):
+                label = "1-2 чел" if o == 2 else f"{o} чел"
+                parts.append(f"{label} {_rub(room_price(key, date_from, date_to, o))}")
+            lines.append(f"{room['name']}: " + ", ".join(parts))
+    if not lines:
+        return ""
+    return ("[PRICES] за " + str(nights) + " ночей (готовые суммы проживания, НЕ считай сам; "
+            "для комбинации номеров сложи их суммы):\n" + "\n".join(lines))
+
+
 def detect_room_type(text):
     text_low = text.lower()
     for room_type, keywords in ROOM_KEYWORDS.items():
@@ -96,6 +179,9 @@ def init_db():
     # Связь messageId -> текст (для reply: понять, на какое сообщение ответил гость)
     c.execute('''CREATE TABLE IF NOT EXISTS msg_texts
                  (message_id TEXT PRIMARY KEY, text TEXT, ts REAL)''')
+    # Пауза бота по чату (ручной режим, когда диалог ведёт Асель сама)
+    c.execute('''CREATE TABLE IF NOT EXISTS chat_pause
+                 (chat_id TEXT PRIMARY KEY, paused_until REAL, ts REAL)''')
     conn.commit()
     conn.close()
 
@@ -155,6 +241,65 @@ def already_processed(message_id):
     return seen
 
 init_db()
+
+# --- Ручной режим / пауза бота по чату ---
+_bot_sent_texts = {}            # нормализованный текст -> ts: что бот отправил сам (чтобы отличить от ручных сообщений Асели)
+_bot_sent_lock = threading.Lock()
+
+def _norm_text(t):
+    return re.sub(r'\s+', ' ', (t or '')).strip().lower()
+
+def remember_bot_sent(text):
+    """Бот отправил этот текст сам. Помним 15 минут, чтобы потом отличить эхо бота от ручного сообщения оператора."""
+    n = _norm_text(text)
+    if not n:
+        return
+    now = time.time()
+    with _bot_sent_lock:
+        _bot_sent_texts[n] = now
+        for k in [k for k, ts in _bot_sent_texts.items() if now - ts > 900]:
+            _bot_sent_texts.pop(k, None)
+
+def was_sent_by_bot(text):
+    """True если этот текст недавно слал сам бот — значит это его эхо, а не Асель написала вручную."""
+    n = _norm_text(text)
+    if not n:
+        return False
+    with _bot_sent_lock:
+        return n in _bot_sent_texts
+
+def is_bot_disabled(chat_id):
+    """Чат из постоянного стоп-листа (env BOT_DISABLED_CHATS) — бот не пишет туда никогда."""
+    return chat_id in BOT_DISABLED_CHATS
+
+def pause_chat(chat_id, hours=None):
+    """Ставим чат на паузу: бот молчит, диалог ведёт человек. Пауза скользящая — каждое сообщение оператора её продлевает."""
+    hours = HANDOVER_PAUSE_HOURS if hours is None else hours
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    c = conn.cursor()
+    c.execute('INSERT OR REPLACE INTO chat_pause (chat_id, paused_until, ts) VALUES (?, ?, ?)',
+              (chat_id, time.time() + hours * 3600, time.time()))
+    conn.commit()
+    conn.close()
+
+def resume_chat(chat_id):
+    """Снимаем паузу — бот снова отвечает в этом чате."""
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    c = conn.cursor()
+    c.execute('DELETE FROM chat_pause WHERE chat_id = ?', (chat_id,))
+    conn.commit()
+    conn.close()
+
+def is_bot_paused(chat_id):
+    """True если бот сейчас НЕ должен писать в чат: либо он в стоп-листе, либо активна пауза после оператора."""
+    if is_bot_disabled(chat_id):
+        return True
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    c = conn.cursor()
+    c.execute('SELECT paused_until FROM chat_pause WHERE chat_id = ?', (chat_id,))
+    row = c.fetchone()
+    conn.close()
+    return bool(row) and time.time() < (row[0] or 0)
 
 _bnovo_token = {"token": None, "exp": 0}
 
@@ -395,12 +540,12 @@ def find_alternatives(date_from, nights, today, max_days=10, max_options=2):
     return options
 
 def build_availability_context(date_from, date_to, today):
-    # Сезонный гейт — вне 28.04–28.09 в Bnovo не лезем
+    # Сезонный гейт — вне 28.04–28.09 в Bnovo не лезем. Возвращаем (текст, список свободных типов).
     if not in_season(datetime.strptime(date_from, '%Y-%m-%d')):
-        return f"Даты {date_from} вне сезона. База работает с 28 апреля по 28 сентября (ежегодно). Заселение вне этого окна невозможно."
+        return f"Даты {date_from} вне сезона. База работает с 28 апреля по 28 сентября (ежегодно). Заселение вне этого окна невозможно.", []
     data = check_availability_by_type(date_from, date_to)
     if data is None:
-        return f"Данные о наличии недоступны на {date_from} - {date_to}."
+        return f"Данные о наличии недоступны на {date_from} - {date_to}.", []
     free = free_room_types(data, date_to)
     if free:
         ctx = f"Наличие на {date_from} - {date_to}: свободно — {', '.join(free)}."
@@ -411,19 +556,20 @@ def build_availability_context(date_from, date_to, today):
                 ctx += " Модуль: есть свободный у речки."
             elif status == "far":
                 ctx += " Модуль: у речки занято, свободен только модуль №20 — он в стороне от речки, не обещай гостю речку для него."
-        return ctx
+        return ctx, free
     # Всё занято — ищем ближайшие свободные даты
     nights = max(1, (datetime.strptime(date_to, '%Y-%m-%d') - datetime.strptime(date_from, '%Y-%m-%d')).days)
     alts = find_alternatives(date_from, nights, today)
     if not alts:
-        return f"На {date_from} - {date_to} всё занято. Свободных дат в ближайшие 10 дней нет."
+        return f"На {date_from} - {date_to} всё занято. Свободных дат в ближайшие 10 дней нет.", []
     parts = [f"{af} - {at} ({', '.join(fr)})" for af, at, fr in alts]
-    return f"На {date_from} - {date_to} всё занято. Ближайшие свободные даты: " + "; ".join(parts) + "."
+    return f"На {date_from} - {date_to} всё занято. Ближайшие свободные даты: " + "; ".join(parts) + ".", []
 
 SYSTEM_PROMPT = """Ты — Асель, менеджер эко-отеля «Акташ Вилладж» на Алтае. Общаешься в WhatsApp как живой тёплый человек.
 
 ГЛАВНЫЕ ЗАПРЕТЫ (нарушать нельзя никогда):
 - НИКАКОГО MARKDOWN. Запрещены символы * и ** и _ и # вокруг слов. Пиши «Вариант 1: Лофт», а НЕ «**Вариант 1:** Лофт». Пиши «Лофт», а НЕ «**Лофт**». Сообщения идут в WhatsApp и Макс — там звёздочки показываются буквально и выглядят уродливо. Если хочешь выделить — просто текст с двоеточием.
+- НИКАКИХ ТИРЕ (знаки — и –). Живой человек с телефона их не печатает, тире сразу выдаёт робота. Пиши короткими предложениями через точку или запятую, длинную мысль разбивай на отдельные сообщения через |||. Дефис в датах (14-17 июня) — это нормально, его оставляй.
 - НЕ пиши «Что ближе?» — НИКОГДА. Это шаблонная фраза. Если надо подтолкнуть к выбору — «Какой вариант берём?» или просто закончи без вопроса.
 - Только русский язык, никогда не транслит.
 - Не упоминай год в ответе — пиши «21 июня», а не «21 июня 2026».
@@ -455,50 +601,39 @@ SYSTEM_PROMPT = """Ты — Асель, менеджер эко-отеля «А�
 - Тёплая, приветливая, по-человечески. Без «Отлично!», «С удовольствием!», «Замечательно!».
 - На простой вопрос — 2-5 слов.
 - Один вопрос за раз.
-- Цены формулой: 7500+300=7800
-- Эмодзи умеренно и к месту (пара за разговор, не в каждом сообщении). Природные: 🏔 🌿 ✅. Если хочешь эмодзи с лицом — используй только 🤗 (не 🙂 и не другие смайлы с лицом).
+- Цены называй готовой суммой из блока [PRICES]. Не показывай формул и расчётов.
+- Эмодзи РЕДКО. Не ставь эмодзи в каждое сообщение и не повторяй один и тот же — одинаковый смайлик в каждом ответе сразу выдаёт бота. На весь диалог одно-два эмодзи максимум, чаще вообще без них. Если уместно: 🤗 🙌 🌞 🏔 🌿 ✅, но без фанатизма и каждый раз разные, а не один и тот же.
 - После показа/описания номера не спрашивай «подскажу стоимость» и не сыпь вопросами. Заверши мягко и коротко, например: «На какие даты смотрите?»
 - НИКОГДА не используй markdown-форматирование: никаких **жирный**, *курсив*, __подчёркивание__. Только обычный текст — сообщения читаются в WhatsApp и Макс, там markdown не работает или выглядит уродливо.
 - НЕ пиши «Что ближе?» в конце — это звучит шаблонно. Если нужно подтолкнуть к выбору, спроси конкретно: «Какой вариант берём?» или просто замолчи и жди.
 - Когда предлагаешь несколько вариантов — название + цена в ОДНОМ сообщении на каждый вариант, не разбивай на два отдельных пузыря.
 
 ПЕРВОЕ СООБЩЕНИЕ:
-Если история пустая — «Здравствуйте! ||| Чем могу помочь?». Если в первом сообщении уже вопрос — поздоровайся и сразу ответь. Не здоровайся повторно в идущем диалоге.
+Если история пустая — «Здравствуйте! ||| Чем могу помочь?». Пиши именно «Чем могу помочь?», а НЕ «Чем я вам помочь?» (это неграмотно). Если в первом сообщении уже вопрос — поздоровайся и сразу ответь. Не здоровайся повторно в идущем диалоге.
 
 НАЛИЧИЕ:
 Используй [BNOVO_DATA] — это реальные данные. Предлагай только свободные типы оттуда.
-Если на даты занято, а есть «ближайшие свободные даты» — мягко предложи их. Например: «На эти даты занято ||| Но свободно с 14 по 17 июня — Лофт, A-Frame ||| Подойдёт?»
+Если на даты занято, а есть «ближайшие свободные даты» — мягко предложи их. Например: «На эти даты занято ||| Но свободно с 14 по 17 июня: Лофт, A-Frame ||| Подойдёт?»
 Если в [BNOVO_DATA] «вне сезона» — тепло объясни: база работает с 28 апреля по 28 сентября, предложи летние даты. Например: «Мы открыты с конца апреля по конец сентября 🏔 ||| На январь не заселяем ||| Подобрать даты на лето?»
 
 ТИПЫ РАЗМЕЩЕНИЯ:
 НОМЕРА (в общем доме, возможны соседи): Лофт, Коттедж с террасой, Номер Стандарт.
 ДОМИКИ (отдельные, живёте одни): Модуль, A-Frame, Стандарт домик.
 
-ЦЕНЫ за ночь (база — за 2 человек):
-- Номер Стандарт: 5000₽. Доп. место (раскладушка) +500₽. Макс 3 человека. Без холодильника.
-- Стандарт домик: 5500₽. Доп. место (раскладушка) +500₽. Макс 3 человека.
-- Коттедж с террасой: 6500₽. Доп. места (диван): +300₽ за одного, +600₽ за двоих. Макс 4. У речки, 2 этажа.
-- Лофт: до 1 июля 7500₽, после 7800₽. Диван: +300₽ за одного, +600₽ за двоих. Макс 4. У речки, 2 этажа.
-- Модуль: до 1 июля 7500₽, после 7800₽. Диван: +300₽ за одного, +600₽ за двоих. Макс 4. У речки.
-- A-Frame: до 1 июля 8000₽, после 8500₽ — за весь домик, до 6 человек, доплат за людей НЕТ. Самый вместительный.
+ЦЕНЫ — БЕРИ ТОЛЬКО ИЗ БЛОКА [PRICES]:
+В данных приходит блок [PRICES] с уже посчитанными суммами проживания по свободным номерам на нужные даты и число ночей.
+- НИКОГДА не считай сам: ни базу, ни доплату за доп. место, ни умножение на ночи. Все суммы уже готовы в [PRICES].
+- Один номер: назови сумму из [PRICES] для нужного числа гостей (например «Лофт на 3» — бери строку «3 чел»).
+- Несколько номеров (группа): сложи готовые суммы выбранных номеров из [PRICES]. Например Лофт (4) + Модуль (3) — возьми обе суммы из [PRICES] и сложи их.
+- Ребёнок до 5 лет в число гостей НЕ входит, от 5 лет считается как гость (бери строку на соответствующее число).
+- Если блока [PRICES] в данных нет — значит не хватает дат или числа гостей. Сначала уточни их, цену не называй.
+- Никаких формул гостю («7800×3»). Только итоговая сумма.
 
-РАСЧЁТ ЦЕНЫ:
-- База — за 2 человек. Третий/четвёртый — доплата по типу (диван +300 за каждого, раскладушка +500 за одного). Доплата за человека — это ЗА НОЧЬ.
-- Пример Лофт на 3: 7500+300=7800 за ночь. На 4: 7500+600=8100 за ночь.
-- Пример Номер Стандарт на 3: 5000+500=5500 за ночь.
-- A-Frame: всегда фикс за домик, сколько бы ни было гостей (до 6).
-- Считай стоимость только когда знаешь даты и число гостей.
-
-ПОРЯДОК ИТОГОВОГО РАСЧЁТА (всегда так):
-1) Цена за ночь (с доплатами за доп. места).
-2) Умножь на число ночей → стоимость проживания.
-3) Прибавь собак: 500 × число собак × число ночей.
-4) Назови итог. Пример: Лофт на 3, 3 ночи, 1 собака = (7800×3) + (500×1×3) = 23 400 + 1500 = 24 900₽.
-Если номеров несколько (например два Лофта) — цена за ночь складывается, потом × ночи, потом собаки.
+ОСОБЕННОСТИ НОМЕРОВ (не про цену): Номер Стандарт без холодильника. Коттедж и Лофт двухэтажные. A-Frame самый вместительный, до 6 человек.
 
 ДЕТИ:
 До 5 лет — бесплатно, не занимают место и не считаются в вместимость.
-От 5 лет — считается как взрослый: занимает место и оплачивается как доп. человек.
+От 5 лет — считается как взрослый: занимает место и оплачивается как доп. человек (для [PRICES] бери строку на это число гостей).
 
 ВМЕСТИМОСТЬ И БОЛЬШИЕ ГРУППЫ (важно — не ленись с вариантами):
 Вместимость: Стандарты — до 3, Лофт/Коттедж/Модуль — до 4, A-Frame — до 6.
@@ -508,10 +643,10 @@ SYSTEM_PROMPT = """Ты — Асель, менеджер эко-отеля «А�
 - Если A-Frame свободен — добавь его как удобный вариант «один домик на всех» (до 6). Если A-Frame занят — спокойно предлагай комбо из других типов, этого достаточно.
 - Дай 2-3 варианта на выбор. Бери ТОЛЬКО свободные типы, занятые не предлагай.
 - Распределяй людей логично по вместимости (6 = 3+3 или 4+2; 5 = 3+2; 7 = 4+3). Следи, чтобы в каждый номер влезало (Стандарт максимум 3, остальные 4, A-Frame 6).
-- Для каждого варианта посчитай итог (цена за ночь × ночи + собаки). Спроси «Что ближе?».
-Примеры:
-6 чел, свободны A-Frame, Лофт, Модуль: «На шестерых есть варианты 🤗 ||| A-Frame — один домик на всех, 25 500₽ за 3 ночи ||| Или два Лофта по 3 — 48 600₽ ||| Или Лофт + Модуль ||| Что ближе?»
-5 чел, A-Frame занят, свободны Лофт, Модуль, Стандарт: «На пятерых можно так 🤗 ||| Лофт (3) + Стандарт (2) ||| Или Модуль (3) + Стандарт (2) ||| Посчитать стоимость?»
+- Для каждого варианта возьми готовые суммы номеров из [PRICES] и сложи. Не считай сам. В конце можно мягко спросить «Какой вариант берём?» или просто перечислить варианты и замолчать.
+Примеры (суммы в ответе бери из [PRICES], здесь они опущены):
+6 чел, свободны A-Frame, Лофт, Модуль: «На шестерых есть варианты 🤗 ||| A-Frame, один домик на всех, <сумма> ||| Или два Лофта по 3, <сумма> ||| Или Лофт + Модуль ||| Какой вариант берём?»
+5 чел, A-Frame занят, свободны Лофт, Модуль, Стандарт: «На пятерых можно так 🤗 ||| Лофт (3) + Стандарт (2), <сумма> ||| Или Модуль (3) + Стандарт (2), <сумма> ||| Какой вариант берём?»
 
 СОСЕДИ:
 Никогда не упоминай соседей сам — ни «будут соседи», ни «могут быть соседи», ни «живёте одни», ни «без соседей». Ни при каком выборе. Если гость прямо спросит «там есть соседи?» — тогда ответь честно. Иначе — молчи про эту тему полностью.
@@ -525,9 +660,11 @@ SYSTEM_PROMPT = """Ты — Асель, менеджер эко-отеля «А�
 Когда предлагаешь ОДИН конкретный номер и он свободен — дай ссылку [BOOKING_LINK] СРАЗУ вместе с ценой, в том же ответе. Гость по ней сам введёт данные и оплатит.
 Когда предлагаешь НЕСКОЛЬКО вариантов на выбор — ссылку НЕ давай. Сначала назови варианты с ценами, спроси какой берёт, и только когда гость выбрал один — дай ссылку на него. Ссылка в списке из нескольких вариантов выглядит грязно и путает.
 ФИО, телефон, оплату гость вводит в форме — отдельно не спрашивай. Реквизиты карты не давай.
-Ссылку вставляй ровно как в [BOOKING_LINK], ничего не меняй.
-Пример (один номер): «Лофт свободен 🤗 ||| 14-17 июня, 3 ночи — 22 500₽ ||| Забронировать и оплатить: [BOOKING_LINK] ||| Там подтвердите данные и оплатите 🏔»
-Если [BOOKING_LINK] нет (даты не названы) — сначала уточни даты.
+Когда нужна ссылка на бронь, ставь токен [BOOKING_LINK] ровно так, латиницей в квадратных скобках. Настоящую ссылку подставит система. Сам URL не пиши, не копируй и не выдумывай.
+Назвав цену по одному номеру и дав ссылку, остановись. Не добавляй вопрос-дожим вроде «оформляем?», «готовы забронировать?», «будете брать?». Гость сам решит и оплатит по ссылке.
+Пример (один номер): «Лофт свободен 🤗 ||| 14-17 июня, 3 ночи, 22 500₽ ||| Можете оплатить по ссылке, бронь закрепится сразу после оплаты: ||| [BOOKING_LINK]»
+Если [BOOKING_LINK] нет (даты не названы), сначала уточни даты.
+Если гость выбрал вариант из нескольких номеров (группа не влезает в один) — всё равно дай одну ссылку [BOOKING_LINK]. На странице гость сам выберет нужные номера на всю компанию, модуль это подскажет. Сам про «выберите несколько номеров» можешь не писать.
 ОПЛАТА — НИКОГДА НЕ ПОДТВЕРЖДАЙ НА СЛОВО:
 Ты НЕ подтверждаешь оплату сам. Подтверждение приходит АВТОМАТИЧЕСКИ от системы, когда деньги реально поступили — отдельным сообщением «Оплата получена ✅».
 Если гость пишет «я оплатил», «оплата прошла», «подтвердите» или присылает чек/скриншот — НЕ говори «бронь подтверждена», «оплата получена», «всё готово». Гость может ошибиться или обмануть, а ты денег не видишь.
@@ -535,8 +672,8 @@ SYSTEM_PROMPT = """Ты — Асель, менеджер эко-отеля «А�
 Только система (по факту реальной оплаты) присылает «Оплата получена ✅ бронь подтверждена». Ты этого сам не пишешь никогда.
 
 СОБАКА / ЖИВОТНЫЕ:
-Можно. 500₽ за одну собаку за СУТКИ (за каждую ночь, за каждую собаку). Оплата на месте при заезде, паспорт здоровья показать на месте.
-РАСЧЁТ СОБАК: 500 × число собак × число ночей. Примеры: 1 собака 3 ночи = 500×1×3 = 1500₽. 2 собаки 3 ночи = 500×2×3 = 3000₽. НЕ считай собак разово — это плата за каждую ночь.
+Можно. 500₽ в сутки за каждую собаку. Оплата на месте при заезде, паспорт здоровья показать на месте.
+Собака в сумму проживания и в ссылку НЕ входит — это отдельно, платится на ресепшене. Говори просто «собака 500₽ в сутки, оплата на месте», итоговую сумму за собаку считать и называть не нужно.
 
 ФОТО:
 Когда гость просит фото — фото отправит система сама, тебе ничего слать не нужно. Твой текст при этом — МИНИМАЛЬНЫЙ: одна тёплая строка про номер + короткий вопрос про даты. Без перечисления удобств, без цены, без вместимости и доплат.
@@ -547,12 +684,15 @@ SYSTEM_PROMPT = """Ты — Асель, менеджер эко-отеля «А�
 - Группа 10+ человек, жалоба/конфликт, договор/счёт для организации, проблема при заезде.
 - Скидок нет, цены фиксированные.
 
+ГРУППА 10+ ЧЕЛОВЕК (важно): НЕ считай комбинации сам и НЕ выдумывай вместимость. Для таких групп размещение подбирает Асель лично. Ответь тепло: «На такую большую компанию размещение подберёт Асель лично 🤗 ||| Напишите ей: +7-913-693-68-19 ||| Она соберёт лучший вариант под вас». Не перечисляй номера, не считай цены — иначе ошибёшься во вместимости.
+
 УСЛУГИ:
 Баня 1500₽/час, минимум 2 часа. Кафе 08:00-21:00. Беседки у речки, мангалы, костровище, детская площадка, парковка бесплатно.
 Везде: кровать-трансформер, диван, туалет, душ, фен, чайник, посуда, WiFi, холодильник (кроме Номер Стандарт).
 
 ПРАВИЛА:
 Заезд 14:00, выезд 12:00. Предоплата 50%. Документы, паспорта, оплата за животных — всё на месте при заезде.
+Поздний выезд (после 12:00) — по возможности и за доплату, уточняется у Асели при заезде. Пиши именно «поздний выезд», без других слов.
 Отмена: 7+ дней — штраф 10%, менее 7 дней — предоплата не возвращается.
 
 МЕСТО: Республика Алтай, Улаганский район, с. Акташ, ул. Лесная 1Б. Первая линия реки Чуя, горы вокруг.
@@ -567,7 +707,7 @@ SYSTEM_PROMPT = """Ты — Асель, менеджер эко-отеля «А�
 Асель: Можно 🐕 ||| 500₽/день, оплата при заезде ||| Возьмите паспорт здоровья ||| Какие даты?
 
 Клиент: Лофт на двоих 14-17 июня
-Асель: Лофт свободен 🤗 ||| 14-17 июня, 3 ночи — 22 500₽ ||| Забронировать: [BOOKING_LINK] ||| Подтвердите данные и оплатите 🏔
+Асель: Лофт свободен 🤗 ||| 14-17 июня, 3 ночи, 22 500₽ ||| Можете оплатить по ссылке, бронь закрепится сразу после оплаты: ||| [BOOKING_LINK]
 
 Клиент: Стоянка есть?
 Асель: Да, на территории, бесплатно
@@ -632,6 +772,21 @@ def extract_dates(text):
                 dates.append(d)
     return dates
 
+def extract_last_range(text):
+    """Последний диапазон дат в тексте. Для сообщений бота вида
+    '21-24 занято, но свободно 23-26 июля' — вернёт альтернативу (23-26)."""
+    today = datetime.now()
+    tl = text.lower()
+    last = None
+    for m in re.finditer(r'(\d{1,2})\s*(?:по|до|[-–—])\s*(\d{1,2})\s*([а-я]+)', tl):
+        month = _month_from_word(m.group(3))
+        if month:
+            d1 = _make_date(int(m.group(1)), month, today)
+            d2 = _make_date(int(m.group(2)), month, today)
+            if d1 and d2:
+                last = [d1, d2]
+    return last
+
 def extract_nights(text):
     """FIX #8: сколько ночей просит гость. None если не указано."""
     tl = text.lower()
@@ -653,6 +808,14 @@ def extract_adults(text):
         return 3
     if any(w in tl for w in ['четверых', 'четверо']):
         return 4
+    if any(w in tl for w in ['пятерых', 'пятеро']):
+        return 5
+    if any(w in tl for w in ['шестерых', 'шестеро']):
+        return 6
+    if any(w in tl for w in ['семерых', 'семеро']):
+        return 7
+    if any(w in tl for w in ['восьмерых', 'восьмеро']):
+        return 8
     m = re.search(r'(\d{1,2})\s*(?:чел|человек|взросл|гост)', tl)
     if m:
         return max(1, int(m.group(1)))
@@ -673,6 +836,9 @@ def extract_children(text):
     seg = re.sub(r'\d{1,2}\s*[-–—]\s*\d{1,2}', ' ', seg)
     ages = [int(n) for n in re.findall(r'\d{1,2}', seg)]
     return [a for a in ages if 0 <= a <= 17]
+
+def analyze_image(image_url):
+    """Скачивает присланное фото и описывает его через Claude Vision. Возвращает строку-описание или None."""
     try:
         img_response = requests.get(image_url, timeout=10, verify=False)
         if img_response.status_code != 200:
@@ -739,6 +905,95 @@ AVAIL_KW = ["свобод", "есть ли", "можно", "можете", "за
 FOTO_KEYWORDS = ["фото", "покажи", "фотки", "посмотреть", "как выглядит", "покажите",
                  "фотографии", "скинь", "скиньте", "пришли", "прислать", "загляни", "посмотри"]
 
+# Мат и грубые оскорбления (стемы, чтобы ловить склонения). Только однозначно бранное —
+# чтобы не зацепить раздражённого, но реального гостя.
+ABUSE_STEMS = ["хуй", "хуе", "хуё", "хую", "пизд", "ебал", "ебан", "ёбан", "ебло", "ебуч",
+               "заеба", "наеба", "уеба", "разъеб", "долбоёб", "долбоеб", "бляд", "блят",
+               "сука", "суки", "сучк", "мудак", "мудил", "гандон", "гондон", "пидор", "пидар",
+               "членосос", "залуп", "уёбищ", "уебищ", "ублюд", "выродок", "дерьмо", "говно",
+               "сдохни", "мраз", "нахуй", "нахер", "пошёл ты", "пошел ты", "пошла ты"]
+
+def looks_abusive(text):
+    """Грубый мат/оскорбление. Используется только в связке с проверкой на отсутствие намерения брони."""
+    tl = (text or "").lower()
+    return any(s in tl for s in ABUSE_STEMS)
+
+def has_booking_intent(text):
+    """Есть ли признаки реального обращения: даты, тип номера, число гостей или ключевые слова брони."""
+    tl = (text or "").lower()
+    return (bool(extract_dates(text)) or bool(detect_room_type(text))
+            or (extract_adults(text) is not None) or any(kw in tl for kw in AVAIL_KW))
+
+def resolve_booking_dates(user_message, history):
+    """Даты для ссылки на бронь: из текущего сообщения, иначе из сообщений гостя, иначе из последнего предложения бота.
+    Возвращает (date_from, date_to) в формате ГГГГ-ММ-ДД или (None, None)."""
+    d = extract_dates(user_message)
+    if not d:
+        for h in reversed(history):
+            if h['role'] == 'user':
+                f = extract_dates(h['content'])
+                if f:
+                    d = f
+                    break
+    if not d:
+        for h in reversed(history):
+            if h['role'] == 'assistant':
+                f = extract_last_range(h['content'])
+                if f:
+                    d = f
+                    break
+    if not d:
+        return None, None
+    df = d[0]
+    if len(d) >= 2:
+        return df, d[1]
+    nights = extract_nights(user_message)
+    if nights is None:
+        for h in reversed(history):
+            if h['role'] == 'user':
+                n = extract_nights(h['content'])
+                if n:
+                    nights = n
+                    break
+    nights = nights or 1
+    dt = (datetime.strptime(df, '%Y-%m-%d') + timedelta(days=nights)).strftime('%Y-%m-%d')
+    return df, dt
+
+def resolve_guest_count(user_message, history):
+    """Сколько всего гостей. Порядок: явная форма в текущем сообщении -> явная в истории гостя ->
+    число, которым гость ответил на вопрос бота 'сколько человек'. None если нигде не указано."""
+    a = extract_adults(user_message)
+    if a:
+        return a
+    for h in reversed(history):
+        if h['role'] == 'user':
+            a = extract_adults(h['content'])
+            if a:
+                return a
+    # Число-ответ сразу после вопроса бота про количество гостей (например бот: «Сколько человек?» гость: «7»)
+    guest_q = ('сколько человек', 'сколько вас', 'сколько гостей', 'на скольких', 'сколько людей', 'сколько будет')
+    seq = history + [{'role': 'user', 'content': user_message}]
+    for i in range(1, len(seq)):
+        if seq[i]['role'] == 'user' and seq[i - 1]['role'] == 'assistant':
+            if any(q in seq[i - 1]['content'].lower() for q in guest_q):
+                m = re.search(r'\b(\d{1,2})\b', seq[i]['content'])
+                if m and 1 <= int(m.group(1)) <= 20:
+                    return int(m.group(1))
+    return None
+
+def resolve_guests(user_message, history):
+    """Число гостей всей группы и возрасты детей (из текущего сообщения или из истории)."""
+    adults = resolve_guest_count(user_message, history)
+    children = extract_children(user_message)
+    if not children:
+        for h in reversed(history):
+            if h['role'] == 'user':
+                c = extract_children(h['content'])
+                if c:
+                    children = c
+                    break
+    return adults, children
+
 def get_ai_response(user_message, chat_id):
     history = get_history(chat_id)
     bnovo_context = ""
@@ -746,14 +1001,23 @@ def get_ai_response(user_message, chat_id):
     dates = extract_dates(user_message)
     # Гейт: наличие подтягиваем только если сообщение про даты/номера/бронь,
     # а не на "баня есть?" / "да" — иначе цепляем стейл-даты из истории.
-    intent = bool(dates) or detect_room_type(user_message) or any(kw in msg_low for kw in AVAIL_KW)
+    intent = bool(dates) or detect_room_type(user_message) or (extract_adults(user_message) is not None) or any(kw in msg_low for kw in AVAIL_KW)
     if intent and not dates:
+        # Сначала ищем даты в своих сообщениях гостя
         for h in reversed(history):
             if h['role'] == 'user':
                 found = extract_dates(h['content'])
                 if found:
                     dates = found
                     break
+        # Если не нашли — берём ПОСЛЕДНИЕ даты, что бот предлагал (например альтернативу)
+        if not dates:
+            for h in reversed(history):
+                if h['role'] == 'assistant':
+                    found = extract_last_range(h['content'])
+                    if found:
+                        dates = found
+                        break
     if intent and dates:
         date_from = dates[0]
         if len(dates) >= 2:
@@ -770,30 +1034,11 @@ def get_ai_response(user_message, chat_id):
                             break
             nights = nights or 1
             date_to = (datetime.strptime(date_from, '%Y-%m-%d') + timedelta(days=nights)).strftime('%Y-%m-%d')
-        data_ctx = build_availability_context(date_from, date_to, datetime.now())
+        data_ctx, free_names = build_availability_context(date_from, date_to, datetime.now())
         bnovo_context = f"\n[BNOVO_DATA]: {data_ctx}"
-        # Ссылка на модуль бронирования (только в сезоне) — даём её, когда гость готов бронировать
-        if in_season(datetime.strptime(date_from, '%Y-%m-%d')):
-            adults = extract_adults(user_message)
-            if adults is None:
-                for h in reversed(history):
-                    if h['role'] == 'user':
-                        a = extract_adults(h['content'])
-                        if a:
-                            adults = a
-                            break
-            # Дети: ищем возрасты в текущем сообщении, иначе в истории
-            children = extract_children(user_message)
-            if not children:
-                for h in reversed(history):
-                    if h['role'] == 'user':
-                        c = extract_children(h['content'])
-                        if c:
-                            children = c
-                            break
-            link = build_booking_link(date_from, date_to, adults or 2, phone=chat_id, children=children)
-            if link:
-                bnovo_context += f"\n[BOOKING_LINK]: {link}"
+        price_block = build_price_block(date_from, date_to, free_names)
+        if price_block:
+            bnovo_context += f"\n{price_block}"
     sys.stderr.write(f"DEBUG dates={dates} | bnovo={bnovo_context[:150]}\n"); sys.stderr.flush()
     messages = history + [{"role": "user", "content": user_message + bnovo_context}]
     response = client.messages.create(
@@ -802,7 +1047,22 @@ def get_ai_response(user_message, chat_id):
         system=SYSTEM_PROMPT,
         messages=messages
     )
-    return response.content[0].text
+    reply = response.content[0].text
+    # Ссылку на бронь строит и подставляет КОД — только когда модель попросила её токеном [BOOKING_LINK].
+    # Даты берём из текущего сообщения или из истории (гость мог выбрать вариант коротким «3»).
+    if "[BOOKING_LINK]" in reply:
+        df, dt = resolve_booking_dates(user_message, history)
+        link = None
+        if df and dt and in_season(datetime.strptime(df, '%Y-%m-%d')):
+            ad, ch = resolve_guests(user_message, history)
+            link = build_booking_link(df, dt, ad or 2, phone=chat_id, children=ch)
+        if link:
+            reply = reply.replace("[BOOKING_LINK]", link)
+        else:
+            # ссылку не собрать — убираем строки с токеном, не роняя всё сообщение
+            reply = "\n".join(ln for ln in re.split(r'\s*\|\|\|\s*|\n', reply)
+                              if ln.strip() and "[BOOKING_LINK]" not in ln).strip()
+    return reply
 
 ROOM_LABELS = {
     "loft": "Лофт", "aframe": "A-Frame", "kottedzh": "Коттедж с террасой",
@@ -817,7 +1077,30 @@ def _wazzup_msg_id(resp):
     except Exception:
         return None
 
+def sanitize_outgoing(text):
+    """Чистим текст перед отправкой в WhatsApp/MAX:
+    - убираем тире (— и –) — живой человек их не печатает; дефис в датах 14-17 не трогаем
+    - глушим markdown-ссылки и голые ссылки на фото-домен (фото шлёт система отдельным файлом)
+    - снимаем markdown-звёздочки на всякий случай (в WhatsApp/MAX они видны буквально)
+    Это страховка на случай, если модель проскочит мимо правил промпта."""
+    if not text:
+        return text
+    # markdown-ссылки [текст](url) -> убрать (фото уходит отдельным файлом, не ссылкой)
+    text = re.sub(r'\[[^\]]*\]\(https?://[^)]+\)', '', text)
+    # голые ссылки на фото-домен (раздаём фото через Wazzup contentUri, не текстом)
+    text = re.sub(r'https?://\S*githubusercontent\.com/\S+', '', text)
+    # тире — и – и ― заменяем на запятую (дефис-минус в датах остаётся как есть)
+    text = re.sub(r'\s*[—–―]\s*', ', ', text)
+    # markdown-выделение *жирный* / **bold** -> просто текст
+    text = re.sub(r'\*{1,3}([^*]+)\*{1,3}', r'\1', text)
+    # подчистка двойных пробелов и висящих знаков после вырезаний
+    text = re.sub(r'\s{2,}', ' ', text)
+    text = re.sub(r'\s+([,.:])', r'\1', text)
+    return text.strip()
+
 def send_wazzup_message(chat_id, channel_id, text, chat_type="whatsapp"):
+    text = sanitize_outgoing(text)
+    remember_bot_sent(text)
     url = "https://api.wazzup24.com/v3/message"
     headers = {"Authorization": f"Bearer {WAZZUP_API_KEY}", "Content-Type": "application/json"}
     payload = {"channelId": channel_id, "chatId": chat_id, "chatType": chat_type, "text": text}
@@ -853,15 +1136,29 @@ def send_room_photos(chat_id, channel_id, room_type, chat_type="whatsapp"):
         time.sleep(0.5)
         send_wazzup_photo(chat_id, channel_id, photo_url, label=label, chat_type=chat_type)
 
+def split_into_messages(full_text):
+    """Режем ответ на отдельные сообщения по ||| ИЛИ по пустым строкам.
+    Модель не всегда ставит |||, на длинных ответах разделяет переносами — учитываем оба варианта,
+    чтобы сообщения шли пузырями, а не одной простынёй."""
+    chunks = re.split(r'\s*\|\|\|\s*|\n\s*\n', full_text)
+    return [c.strip() for c in chunks if c.strip()]
+
 def send_wazzup_multi(chat_id, channel_id, full_text, chat_type="whatsapp"):
-    parts = [p.strip() for p in full_text.split("|||") if p.strip()]
-    for part in parts:
-        time.sleep(min(len(part) * 0.04, 2.5))
+    # Защита: если модель оставила неподставленный плейсхолдер — убираем строки с ним
+    if "[BOOKING_LINK]" in full_text:
+        full_text = "|||".join(
+            p for p in full_text.split("|||") if "[BOOKING_LINK]" not in p
+        )
+    parts = split_into_messages(full_text)
+    for i, part in enumerate(parts):
+        if i:
+            time.sleep(0.25)  # маленький зазор только для сохранения порядка сообщений
         send_wazzup_message(chat_id, channel_id, part, chat_type)
-        time.sleep(0.4)
     sys.stderr.write(f"Wazzup: отправлено {len(parts)} сообщений\n"); sys.stderr.flush()
 
 def send_max_message(chat_id, text):
+    text = sanitize_outgoing(text)
+    remember_bot_sent(text)
     url = "https://botapi.max.ru/messages"
     params = {"access_token": MAX_TOKEN}
     payload = {"recipient": {"chat_id": chat_id}, "text": text}
@@ -871,13 +1168,13 @@ def send_max_message(chat_id, text):
         sys.stderr.write(f"Max send error: {e}\n"); sys.stderr.flush()
 
 def send_max_multi(chat_id, full_text):
-    parts = [p.strip() for p in full_text.split("|||") if p.strip()]
-    for part in parts:
-        time.sleep(min(len(part) * 0.04, 2.5))
+    parts = split_into_messages(full_text)
+    for i, part in enumerate(parts):
+        if i:
+            time.sleep(0.25)
         send_max_message(chat_id, part)
-        time.sleep(0.4)
 
-DEBOUNCE_SECONDS = 6.0          # ждём, пока гость допишет серию сообщений
+DEBOUNCE_SECONDS = float(os.getenv("DEBOUNCE_SECONDS", "3"))   # ждём, пока гость допишет серию сообщений
 _pending = {}                    # chat_id -> {"msgs":[...], "channel_id":..., "timer":Timer}
 _pending_lock = threading.Lock()
 
@@ -913,12 +1210,22 @@ def flush_chat(chat_id):
     msgs = entry["msgs"]
     channel_id = entry["channel_id"]
     chat_type = entry.get("chat_type", "whatsapp")
+    # Ручной режим: бот на паузе (Асель ведёт диалог) или чат в стоп-листе — не отвечаем,
+    # но сохраняем текст гостя в историю, чтобы при возврате бот видел контекст.
+    if is_bot_paused(chat_id):
+        plain = " ".join(m.get("text", "") for m in msgs
+                         if m.get("type", "text") == "text" and m.get("text")).strip()
+        if plain:
+            save_message(chat_id, "user", plain)
+        sys.stderr.write(f"PAUSED: гость написал в {chat_id}, бот молчит (ручной режим)\n"); sys.stderr.flush()
+        return
     try:
         texts = []
         photo_descs = []
         room_from_photo = None
         quoted_text = None
         has_audio = False
+        has_image = False
         for msg in msgs:
             mt = msg.get("type", "text")
             if mt in ("audio", "voice", "ptt"):
@@ -929,6 +1236,7 @@ def flush_chat(chat_id):
                     if spoken:
                         texts.append(spoken)  # распознанная речь идёт как обычный текст
             elif mt in ("image", "photo"):
+                has_image = True
                 url = msg.get("fileUrl") or msg.get("url") or msg.get("imageUrl", "")
                 if url:
                     desc = analyze_image(url)
@@ -953,10 +1261,18 @@ def flush_chat(chat_id):
 
         combined = " ".join(texts).strip()
 
-        # Голос пришёл, но распознать не удалось (или пустой)
+        # Тролль/мат без намерения брони — не реагируем (не кормим тролля и не тратим ответ модели)
+        if combined and looks_abusive(combined) and not has_booking_intent(combined):
+            save_message(chat_id, "user", combined)
+            sys.stderr.write(f"IGNORED abuse from {chat_id}: {combined[:60]}\n"); sys.stderr.flush()
+            return
+
+        # Медиа пришло, но распознать не удалось (пустой текст и нет описания фото)
         if not combined and not photo_descs:
-            if has_audio:
-                send_wazzup_multi(chat_id, channel_id, "Ой, не расслышала голосовое 🙏 ||| Повторите или напишите текстом — сразу помогу", chat_type)
+            if has_image:
+                send_wazzup_multi(chat_id, channel_id, "Спасибо за фото 🤗 ||| Подскажите, по какому номеру вопрос?", chat_type)
+            elif has_audio:
+                send_wazzup_multi(chat_id, channel_id, "Ой, не расслышала голосовое 🙏 ||| Повторите или напишите текстом, сразу помогу", chat_type)
             return
 
         # Тип номера: из текста, из цитаты, или с присланной карточки/фото
@@ -983,6 +1299,10 @@ def flush_chat(chat_id):
 
 def process_max_message(chat_id, text):
     """FIX #6: фоновая обработка сообщения из MAX."""
+    if is_bot_paused(chat_id):
+        save_message(chat_id, "user", text)
+        sys.stderr.write(f"PAUSED MAX: бот молчит в {chat_id} (ручной режим)\n"); sys.stderr.flush()
+        return
     try:
         ai_reply = get_ai_response(text, chat_id)
         save_message(chat_id, "user", text)
@@ -1005,12 +1325,24 @@ def webhook():
             # Эхо своих исходящих текстов — запоминаем messageId->текст для reply (запасной путь)
             if msg.get("isEcho") and msg.get("type") == "text" and msg.get("text") and msg.get("messageId"):
                 remember_msg_text(msg.get("messageId"), msg.get("text"))
+            # Исходящее сообщение. Если его отправил НЕ бот — значит Асель написала вручную:
+            # ставим чат на паузу и сохраняем её реплику в историю (контекст для возврата бота).
             if msg.get("status") != "inbound":
+                txt = msg.get("text", "")
+                cid = msg.get("chatId", "")
+                if txt and cid and not was_sent_by_bot(txt):
+                    pause_chat(cid)
+                    save_message(cid, "assistant", txt)
+                    sys.stderr.write(f"HANDOVER: оператор написал в {cid}, бот на паузе {HANDOVER_PAUSE_HOURS}ч\n"); sys.stderr.flush()
                 continue
             if msg.get("chatType") == "whatsgroup":
                 continue
             chat_id = msg.get("chatId", "")
             if not chat_id:
+                continue
+            # Постоянный стоп-лист: бот вообще не трогает эти чаты
+            if is_bot_disabled(chat_id):
+                sys.stderr.write(f"SKIP disabled chat {chat_id}\n"); sys.stderr.flush()
                 continue
 
             # FIX #5: дедуп по id сообщения
@@ -1043,6 +1375,28 @@ def bnovo_webhook():
 @app.route("/", methods=["GET"])
 def index():
     return "Aktash Villadzh Bot rabotaet!"
+
+@app.route("/admin/bot", methods=["GET", "POST"])
+def admin_bot():
+    """Ручное управление паузой бота по чату (нужен ADMIN_TOKEN в env).
+    Примеры:
+      /admin/bot?token=XXX&chat_id=79991234567&action=pause&hours=24
+      /admin/bot?token=XXX&chat_id=79991234567&action=resume
+      /admin/bot?token=XXX&chat_id=79991234567   (просто статус)"""
+    if not ADMIN_TOKEN or request.args.get("token") != ADMIN_TOKEN:
+        return {"error": "unauthorized"}, 401
+    chat_id = request.args.get("chat_id", "")
+    if not chat_id:
+        return {"error": "chat_id required"}, 400
+    action = request.args.get("action", "status")
+    if action == "pause":
+        hours = float(request.args.get("hours", HANDOVER_PAUSE_HOURS))
+        pause_chat(chat_id, hours)
+        return {"chat_id": chat_id, "paused": True, "hours": hours}
+    if action == "resume":
+        resume_chat(chat_id)
+        return {"chat_id": chat_id, "paused": False}
+    return {"chat_id": chat_id, "paused": is_bot_paused(chat_id), "disabled": is_bot_disabled(chat_id)}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
