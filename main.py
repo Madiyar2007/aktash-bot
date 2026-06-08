@@ -225,6 +225,36 @@ def save_message(chat_id, role, content):
     conn.commit()
     conn.close()
 
+def _altai_now():
+    """Текущее время по Алтаю (UTC+7) — по нему считаем 'новый день' для приветствия."""
+    return datetime.utcnow() + timedelta(hours=7)
+
+def should_greet(chat_id):
+    """True, если это первое обращение гостя за сегодня (новый чат или наступил новый день). Тогда здороваемся."""
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    c = conn.cursor()
+    c.execute("SELECT timestamp FROM messages WHERE chat_id = ? ORDER BY id DESC LIMIT 1", (chat_id,))
+    row = c.fetchone()
+    conn.close()
+    if not row or not row[0]:
+        return True  # новый чат — здороваемся
+    try:
+        last = datetime.strptime(str(row[0])[:19], "%Y-%m-%d %H:%M:%S") + timedelta(hours=7)
+    except (ValueError, TypeError):
+        return False
+    return last.date() != _altai_now().date()  # последнее сообщение было в другой день
+
+def greeting_word():
+    """Приветствие по времени суток (по Алтаю)."""
+    h = _altai_now().hour
+    if 5 <= h < 12:
+        return "Доброе утро"
+    if 12 <= h < 18:
+        return "Добрый день"
+    if 18 <= h < 23:
+        return "Добрый вечер"
+    return "Здравствуйте"
+
 def already_processed(message_id):
     """FIX #5: True если это сообщение уже обрабатывали. Атомарно — решаем по факту INSERT, а не SELECT+INSERT."""
     now = time.time()
@@ -602,19 +632,22 @@ SYSTEM_PROMPT = """Ты — Асель, менеджер эко-отеля «А�
 - На простой вопрос — 2-5 слов.
 - Один вопрос за раз.
 - Цены называй готовой суммой из блока [PRICES]. Не показывай формул и расчётов.
-- Эмодзи РЕДКО. Не ставь эмодзи в каждое сообщение и не повторяй один и тот же — одинаковый смайлик в каждом ответе сразу выдаёт бота. На весь диалог одно-два эмодзи максимум, чаще вообще без них. Если уместно: 🤗 🙌 🌞 🏔 🌿 ✅, но без фанатизма и каждый раз разные, а не один и тот же.
+- Эмодзи РЕДКО. Не ставь эмодзи в каждое сообщение и не повторяй один и тот же — одинаковый смайлик в каждом ответе сразу выдаёт бота. На весь диалог одно-два эмодзи максимум, чаще вообще без них. НИКОГДА не ставь эмодзи в сообщениях про занятость, отказ, отмену, проблему или плохие новости — там он неуместен. В позитивном контексте можно изредка: 🤗 🙌 🌞 🌿, без фанатизма и каждый раз разные.
 - После показа/описания номера не спрашивай «подскажу стоимость» и не сыпь вопросами. Заверши мягко и коротко, например: «На какие даты смотрите?»
 - НИКОГДА не используй markdown-форматирование: никаких **жирный**, *курсив*, __подчёркивание__. Только обычный текст — сообщения читаются в WhatsApp и Макс, там markdown не работает или выглядит уродливо.
 - НЕ пиши «Что ближе?» в конце — это звучит шаблонно. Если нужно подтолкнуть к выбору, спроси конкретно: «Какой вариант берём?» или просто замолчи и жди.
 - Когда предлагаешь несколько вариантов — название + цена в ОДНОМ сообщении на каждый вариант, не разбивай на два отдельных пузыря.
 
-ПЕРВОЕ СООБЩЕНИЕ:
-Если история пустая — «Здравствуйте! ||| Чем могу помочь?». Пиши именно «Чем могу помочь?», а НЕ «Чем я вам помочь?» (это неграмотно). Если в первом сообщении уже вопрос — поздоровайся и сразу ответь. Не здоровайся повторно в идущем диалоге.
+ПЕРВОЕ СООБЩЕНИЕ И ПРИВЕТСТВИЕ:
+Здоровайся, если в данных есть пометка [GREET] (это первое обращение гостя за сегодня) ИЛИ если история пустая. Приветствие бери из [GREET]: Доброе утро / Добрый день / Добрый вечер по времени суток. Если истории нет и нет вопроса — «Здравствуйте! ||| Чем могу помочь?». Пиши именно «Чем могу помочь?», а НЕ «Чем я вам помочь?» (это неграмотно).
+Если [GREET] НЕТ и идёт диалог — НЕ здоровайся повторно, просто отвечай.
+Если в сообщении гостя уже есть вопрос — поздоровайся (только если положено по правилу выше) и сразу ответь.
 
 НАЛИЧИЕ:
 Используй [BNOVO_DATA] — это реальные данные. Предлагай только свободные типы оттуда.
 Если на даты занято, а есть «ближайшие свободные даты» — мягко предложи их. Например: «На эти даты занято ||| Но свободно с 14 по 17 июня: Лофт, A-Frame ||| Подойдёт?»
-Если в [BNOVO_DATA] «вне сезона» — тепло объясни: база работает с 28 апреля по 28 сентября, предложи летние даты. Например: «Мы открыты с конца апреля по конец сентября 🏔 ||| На январь не заселяем ||| Подобрать даты на лето?»
+Если исходные даты заняты И гость с компанией 5+ человек — НЕ вываливай просто список свободных типов. Скажи, что на альтернативные даты свободно, и спроси, посчитать ли вариант под их компанию, потом жди ответа. Например: «На 17-26 занято ||| На 12-21 июля свободно Лофт и Стандарт домик ||| Посчитать под вашу компанию?»
+Если в [BNOVO_DATA] «вне сезона» — тепло объясни: база работает с 28 апреля по 28 сентября, предложи летние даты. Например: «Мы открыты с конца апреля по конец сентября ||| На январь не заселяем ||| Подобрать даты на лето?»
 
 ТИПЫ РАЗМЕЩЕНИЯ:
 НОМЕРА (в общем доме, возможны соседи): Лофт, Коттедж с террасой, Номер Стандарт.
@@ -930,18 +963,10 @@ def resolve_booking_dates(user_message, history):
     d = extract_dates(user_message)
     if not d:
         for h in reversed(history):
-            if h['role'] == 'user':
-                f = extract_dates(h['content'])
-                if f:
-                    d = f
-                    break
-    if not d:
-        for h in reversed(history):
-            if h['role'] == 'assistant':
-                f = extract_last_range(h['content'])
-                if f:
-                    d = f
-                    break
+            f = extract_dates(h['content']) if h['role'] == 'user' else extract_last_range(h['content'])
+            if f:
+                d = f
+                break
     if not d:
         return None, None
     df = d[0]
@@ -997,27 +1022,22 @@ def resolve_guests(user_message, history):
 def get_ai_response(user_message, chat_id):
     history = get_history(chat_id)
     bnovo_context = ""
+    if should_greet(chat_id):
+        bnovo_context += f"\n[GREET]: первое обращение гостя за сегодня — поздоровайся естественно (например «{greeting_word()}»), потом ответь."
     msg_low = user_message.lower()
     dates = extract_dates(user_message)
     # Гейт: наличие подтягиваем только если сообщение про даты/номера/бронь,
     # а не на "баня есть?" / "да" — иначе цепляем стейл-даты из истории.
     intent = bool(dates) or detect_room_type(user_message) or (extract_adults(user_message) is not None) or any(kw in msg_low for kw in AVAIL_KW)
     if intent and not dates:
-        # Сначала ищем даты в своих сообщениях гостя
+        # Берём самые свежие даты из диалога: от гостя (extract_dates) или из последнего предложения бота
+        # (extract_last_range) — что встретится раньше при обходе с конца. Так согласие гостя после
+        # альтернативы от бота («свободно 12-21») цепляется к ЭТИМ датам, а не к старым занятым.
         for h in reversed(history):
-            if h['role'] == 'user':
-                found = extract_dates(h['content'])
-                if found:
-                    dates = found
-                    break
-        # Если не нашли — берём ПОСЛЕДНИЕ даты, что бот предлагал (например альтернативу)
-        if not dates:
-            for h in reversed(history):
-                if h['role'] == 'assistant':
-                    found = extract_last_range(h['content'])
-                    if found:
-                        dates = found
-                        break
+            found = extract_dates(h['content']) if h['role'] == 'user' else extract_last_range(h['content'])
+            if found:
+                dates = found
+                break
     if intent and dates:
         date_from = dates[0]
         if len(dates) >= 2:
@@ -1035,7 +1055,7 @@ def get_ai_response(user_message, chat_id):
             nights = nights or 1
             date_to = (datetime.strptime(date_from, '%Y-%m-%d') + timedelta(days=nights)).strftime('%Y-%m-%d')
         data_ctx, free_names = build_availability_context(date_from, date_to, datetime.now())
-        bnovo_context = f"\n[BNOVO_DATA]: {data_ctx}"
+        bnovo_context += f"\n[BNOVO_DATA]: {data_ctx}"
         price_block = build_price_block(date_from, date_to, free_names)
         if price_block:
             bnovo_context += f"\n{price_block}"
