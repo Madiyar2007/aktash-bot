@@ -685,8 +685,36 @@ def process_bnovo_booking(booking_id):
     except Exception as e:
         sys.stderr.write(f"process_bnovo_booking error: {e}\n"); sys.stderr.flush()
 
-def find_alternatives(date_from, nights, today, max_days=10, max_options=2):
-    """Ищет ближайшие свободные даты той же длины (и до, и после запрошенных), только в сезоне."""
+def _counts_capacity(counts):
+    """Сколько всего гостей вмещают свободные номера из {название: число}."""
+    cap = 0
+    for name, cnt in counts.items():
+        tid = NAME_TO_TYPEID.get(name)
+        cap += ROOM_MAX.get(tid, 2) * cnt
+    return cap
+
+_NUM_WORDS = {'один': 1, 'одна': 1, 'одно': 1, 'два': 2, 'две': 2, 'три': 3, 'четыре': 4,
+              'пять': 5, 'шесть': 6, 'семь': 7, 'восемь': 8, 'девять': 9, 'десять': 10}
+
+def requested_room_count(user_message, history):
+    """Сколько НОМЕРОВ просит гость: 'три Номера Стандарт' -> 3, '2 лофта' -> 2. None если не указано.
+    Число гостей ('два человека') сюда НЕ попадает — нужно слово-номер после числа."""
+    num_alt = '|'.join(_NUM_WORDS)
+    rx = re.compile(r'\b(\d{1,2}|' + num_alt + r')\s+(?:[а-яё]+\s+)?(номер|лофт|модул|домик|коттедж|frame|фрейм)')
+    texts = [user_message] + [h['content'] for h in reversed(history) if h['role'] == 'user']
+    for t in texts:
+        m = rx.search((t or '').lower())
+        if m:
+            tok = m.group(1)
+            n = int(tok) if tok.isdigit() else _NUM_WORDS.get(tok)
+            if n and 1 <= n <= 15:
+                return n
+    return None
+
+def find_alternatives(date_from, nights, today, need_guests=None, need_rooms=None, max_days=10, max_options=2):
+    """Ищет ближайшие свободные даты той же длины (и до, и после), только в сезоне.
+    Отбирает только даты, куда реально помещается запрос: хватает номеров (need_rooms) и
+    мест по вместимости (need_guests). Возвращает [(date_from, date_to, {название: число}), ...]."""
     options = []
     seen = set()
     base = datetime.strptime(date_from, '%Y-%m-%d')
@@ -702,16 +730,21 @@ def find_alternatives(date_from, nights, today, max_days=10, max_options=2):
                 continue
             seen.add(sf)
             st = (start + timedelta(days=nights)).strftime('%Y-%m-%d')
-            free = free_room_types(check_availability_by_type(sf, st), st)
-            if free:
-                options.append((sf, st, free))
-                if len(options) >= max_options:
-                    return options
+            counts = free_room_counts(check_availability_by_type(sf, st), st)
+            if not counts:
+                continue
+            if need_rooms and sum(counts.values()) < need_rooms:
+                continue  # номеров не хватает на запрошенное количество
+            if need_guests and _counts_capacity(counts) < need_guests:
+                continue  # по вместимости компания не помещается
+            options.append((sf, st, counts))
+            if len(options) >= max_options:
+                return options
         if options:  # нашли на ближайшем сдвиге — дальше не ищем
             return options
     return options
 
-def build_availability_context(date_from, date_to, today):
+def build_availability_context(date_from, date_to, today, need_guests=None, need_rooms=None):
     # Сезонный гейт — вне 28.04–28.09 в Bnovo не лезем. Возвращаем (текст, список свободных типов).
     if not in_season(datetime.strptime(date_from, '%Y-%m-%d')):
         return f"Даты {date_from} вне сезона. База работает с 28 апреля по 28 сентября (ежегодно). Заселение вне этого окна невозможно.", []
@@ -720,25 +753,40 @@ def build_availability_context(date_from, date_to, today):
         return f"Данные о наличии недоступны на {date_from} - {date_to}.", []
     counts = free_room_counts(data, date_to)
     free = list(counts.keys())
-    if free:
+    total_rooms = sum(counts.values())
+    cap = _counts_capacity(counts)
+    # Хватает ли свободного на запрос на ЭТИ даты (по числу номеров и по вместимости)
+    enough = bool(free) and (not need_rooms or total_rooms >= need_rooms) \
+             and (not need_guests or cap >= need_guests)
+    if enough:
         parts = [f"{nm} ({cnt} шт)" for nm, cnt in counts.items()]
         ctx = (f"Наличие на {date_from} - {date_to}: свободно — {', '.join(parts)}. "
                f"Число в скобках — сколько таких номеров свободно, больше этого не предлагай.")
-        # Для Модуля уточняем у речки или нет (внутри типа есть и речные, и №20 в стороне)
-        if "Модуль" in free:
+        if "Модуль" in free:  # внутри типа есть и речные, и №20 в стороне
             status = modul_river_status(date_from, date_to)
             if status == "river":
                 ctx += " Модуль: есть свободный у речки."
             elif status == "far":
                 ctx += " Модуль: у речки занято, свободен только модуль №20 — он в стороне от речки, не обещай гостю речку для него."
         return ctx, free
-    # Всё занято — ищем ближайшие свободные даты
+    # Свободного на запрос не хватает (всё занято ИЛИ номеров/мест мало) — САМИ ищем подходящие даты,
+    # чтобы модель не выдумывала. Альтернативы отбираются под нужное число номеров и гостей.
     nights = max(1, (datetime.strptime(date_to, '%Y-%m-%d') - datetime.strptime(date_from, '%Y-%m-%d')).days)
-    alts = find_alternatives(date_from, nights, today)
+    alts = find_alternatives(date_from, nights, today, need_guests=need_guests, need_rooms=need_rooms)
+    if free:
+        fp = ", ".join(f"{nm} ({cnt} шт)" for nm, cnt in counts.items())
+        head = f"На {date_from} - {date_to} свободно только: {fp}. На запрос не хватает. "
+    else:
+        head = f"На {date_from} - {date_to} всё занято. "
     if not alts:
-        return f"На {date_from} - {date_to} всё занято. Свободных дат в ближайшие 10 дней нет.", []
-    parts = [f"{af} - {at} ({', '.join(fr)})" for af, at, fr in alts]
-    return f"На {date_from} - {date_to} всё занято. Ближайшие свободные даты: " + "; ".join(parts) + ".", []
+        return head + ("Подходящих дат в ближайшие 10 дней тоже нет. Предложи гостю назвать другой "
+                       "период или изменить состав. НЕ придумывай даты сам."), []
+    parts = []
+    for af, at, cnts in alts:
+        ct = ", ".join(f"{nm} {c} шт" for nm, c in cnts.items())
+        parts.append(f"{af} - {at} (свободно: {ct})")
+    return (head + "Ближайшие ПОДХОДЯЩИЕ даты (проверены, мест хватает): " + "; ".join(parts)
+            + ". Предлагай ТОЛЬКО эти даты и ТОЛЬКО из этих количеств. НЕ придумывай других дат и не обещай больше номеров, чем указано."), []
 
 SYSTEM_PROMPT = """Ты — Асель, менеджер эко-отеля «Акташ Вилладж» на Алтае. Общаешься в WhatsApp как живой тёплый человек.
 
@@ -790,7 +838,9 @@ SYSTEM_PROMPT = """Ты — Асель, менеджер эко-отеля «А�
 
 НАЛИЧИЕ:
 Используй [BNOVO_DATA] — это реальные данные. Предлагай только свободные типы оттуда.
+КРИТИЧНО: любые ДАТЫ и КОЛИЧЕСТВА номеров бери ТОЛЬКО из [BNOVO_DATA]. НИКОГДА не придумывай свободные даты и не обещай число номеров, которого там нет. Если гость просит «другие даты», а в [BNOVO_DATA] предложены конкретные подходящие даты — назови ИХ. Если подходящих дат там нет — честно скажи, что на ближайшее время не нашлось, и попроси гостя назвать период или изменить состав. Выдумать дату и потом отказать — грубая ошибка.
 Если на даты занято, а есть «ближайшие свободные даты» — мягко предложи их. Например: «На эти даты занято ||| Но свободно с 14 по 17 июня: Лофт, A-Frame ||| Подойдёт?»
+Если в [BNOVO_DATA] сказано «свободно только: … на запрос не хватает» — значит на эти даты компанию/нужное число номеров не разместить. Не предлагай неполный набор как решение, сразу переходи к подходящим датам из [BNOVO_DATA].
 Если исходные даты заняты И гость с компанией 5+ человек — НЕ вываливай просто список свободных типов. Скажи, что на альтернативные даты свободно, и спроси, посчитать ли вариант под их компанию, потом жди ответа. Например: «На 17-26 занято ||| На 12-21 июля свободно Лофт и Стандарт домик ||| Посчитать под вашу компанию?»
 Если в [BNOVO_DATA] «вне сезона» — тепло объясни: база работает с 28 апреля по 28 сентября, предложи летние даты. Например: «Мы открыты с конца апреля по конец сентября ||| На январь не заселяем ||| Подобрать даты на лето?»
 
@@ -1241,7 +1291,9 @@ def get_ai_response(user_message, chat_id):
                             break
             nights = nights or 1
             date_to = (datetime.strptime(date_from, '%Y-%m-%d') + timedelta(days=nights)).strftime('%Y-%m-%d')
-        data_ctx, free_names = build_availability_context(date_from, date_to, datetime.now())
+        need_guests = resolve_guest_count(user_message, history)
+        need_rooms = requested_room_count(user_message, history)
+        data_ctx, free_names = build_availability_context(date_from, date_to, datetime.now(), need_guests, need_rooms)
         bnovo_context += f"\n[BNOVO_DATA]: {data_ctx}"
         price_block = build_price_block(date_from, date_to, free_names)
         if price_block:
