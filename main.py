@@ -815,6 +815,29 @@ def _make_date(day, month, today):
             return d.strftime('%Y-%m-%d')
     return None
 
+_RANGE_MONTH = re.compile(r'(\d{1,2})\s*(?:по|до|[-–—])\s*(\d{1,2})\s*([а-я]+)')      # "20-27 июля"
+_MONTH_RANGE = re.compile(r'([а-я]+)\s*,?\s*(\d{1,2})\s*(?:по|до|[-–—])\s*(\d{1,2})')  # "июль 20-27", "Июль, 20-27 числа"
+
+def _ranges_in(text_low, today):
+    """Все диапазоны дат в тексте в ОБОИХ порядках: 'ДД-ДД месяц' и 'месяц ДД-ДД'.
+    Возвращает список [d1, d2]. Нужно, чтобы понимать и '20-27 июля', и 'Июль, 20-27 числа'."""
+    found = []
+    for m in _RANGE_MONTH.finditer(text_low):
+        month = _month_from_word(m.group(3))
+        if month:
+            d1 = _make_date(int(m.group(1)), month, today)
+            d2 = _make_date(int(m.group(2)), month, today)
+            if d1 and d2:
+                found.append([d1, d2])
+    for m in _MONTH_RANGE.finditer(text_low):
+        month = _month_from_word(m.group(1))
+        if month:
+            d1 = _make_date(int(m.group(2)), month, today)
+            d2 = _make_date(int(m.group(3)), month, today)
+            if d1 and d2:
+                found.append([d1, d2])
+    return found
+
 def extract_dates(text):
     text_low = text.lower()
     today = datetime.now()
@@ -832,15 +855,10 @@ def extract_dates(text):
     if dates:
         return dates
 
-    # 2) FIX #2: диапазон с общим месяцем — "с 9 по 13 июня", "9-13 июня"
-    rng = re.search(r'(\d{1,2})\s*(?:по|до|[-–—])\s*(\d{1,2})\s*([а-я]+)', text_low)
-    if rng:
-        month = _month_from_word(rng.group(3))
-        if month:
-            d1 = _make_date(int(rng.group(1)), month, today)
-            d2 = _make_date(int(rng.group(2)), month, today)
-            if d1 and d2:
-                return [d1, d2]
+    # 2) Диапазон с месяцем в любом порядке: "9-13 июня", "июнь 9-13", "Июль, 20-27 числа"
+    ranges = _ranges_in(text_low, today)
+    if ranges:
+        return ranges[0]
 
     # 3) Одиночные пары "число месяц" — "13 июня", "с 9 июня по 13 июля"
     for m in re.finditer(r'(\d{1,2})\s*([а-я]+)', text_low):
@@ -852,19 +870,10 @@ def extract_dates(text):
     return dates
 
 def extract_last_range(text):
-    """Последний диапазон дат в тексте. Для сообщений бота вида
-    '21-24 занято, но свободно 23-26 июля' — вернёт альтернативу (23-26)."""
-    today = datetime.now()
-    tl = text.lower()
-    last = None
-    for m in re.finditer(r'(\d{1,2})\s*(?:по|до|[-–—])\s*(\d{1,2})\s*([а-я]+)', tl):
-        month = _month_from_word(m.group(3))
-        if month:
-            d1 = _make_date(int(m.group(1)), month, today)
-            d2 = _make_date(int(m.group(2)), month, today)
-            if d1 and d2:
-                last = [d1, d2]
-    return last
+    """Последний диапазон дат в тексте (оба порядка написания). Для сообщений бота
+    '21-24 занято, но свободно 23-26 июля' вернёт альтернативу (23-26)."""
+    ranges = _ranges_in(text.lower(), datetime.now())
+    return ranges[-1] if ranges else None
 
 def extract_nights(text):
     """FIX #8: сколько ночей просит гость. None если не указано."""
@@ -979,7 +988,8 @@ def transcribe_audio(audio_url):
 AVAIL_KW = ["свобод", "есть ли", "можно", "можете", "забронир", "брон", "заезд",
             "засел", "размест", "ноч", "чел", "человек", "мест", "приед",
             "остановит", "номер", "дата", "числ", "взросл", "детей", "ребён",
-            "ребенк", "семь", "собак", "нас двое", "нас трое", "нас четыр"]
+            "ребенк", "семь", "собак", "нас двое", "нас трое", "нас четыр",
+            "цена", "цену", "цены", "стоимост", "стоит", "почём", "почем", "сколько"]
 
 FOTO_KEYWORDS = ["фото", "покажи", "фотки", "посмотреть", "как выглядит", "покажите",
                  "фотографии", "скинь", "скиньте", "пришли", "прислать", "загляни", "посмотри"]
