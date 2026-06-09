@@ -701,11 +701,12 @@ SYSTEM_PROMPT = """Ты — Асель, менеджер эко-отеля «А�
 ДОМИКИ (отдельные, живёте одни): Модуль, A-Frame, Стандарт домик.
 
 ЦЕНЫ — БЕРИ ТОЛЬКО ИЗ БЛОКА [PRICES]:
+КРИТИЧНО: НИКОГДА не придумывай, не прикидывай и не вспоминай цену из головы. ЛЮБАЯ названная сумма обязана быть из блока [PRICES] в данных. Если блока [PRICES] нет — ты НЕ ЗНАЕШЬ цену: ответь «Сейчас уточню стоимость» и НЕ называй никаких чисел. Назвать выдуманную сумму — грубая ошибка.
 В данных приходит блок [PRICES] с реальными ценами Bnovo по свободным номерам на нужные даты. Цена за НОМЕР фиксированная — она НЕ зависит от числа гостей, доплат за доп. место нет.
-- НИКОГДА не считай сам. Все суммы уже готовы в [PRICES].
+- НИКОГДА не считай базу/ночи сам. Все суммы уже готовы в [PRICES].
 - Один номер: назови его сумму из [PRICES].
-- Несколько номеров (группа): сложи суммы выбранных номеров из [PRICES]. Например Лофт + Стандарт домик — возьми обе суммы и сложи их.
-- Если блока [PRICES] в данных нет — значит цены сейчас недоступны или не хватает дат. НЕ называй сумму: скажи «сейчас уточню стоимость» или попроси даты.
+- Несколько номеров (группа): сложи суммы выбранных номеров из [PRICES]. Три Номера Стандарт — это три суммы Номера Стандарт сложить. Лофт + Домик — сложить обе суммы.
+- Если блока [PRICES] в данных нет — скажи «сейчас уточню стоимость», чисел не называй.
 - Никаких формул гостю. Только итоговая сумма.
 
 ОСОБЕННОСТИ НОМЕРОВ (не про цену): Номер Стандарт без холодильника. Коттедж и Лофт двухэтажные. A-Frame самый вместительный, до 6 человек.
@@ -991,6 +992,23 @@ AVAIL_KW = ["свобод", "есть ли", "можно", "можете", "за
             "ребенк", "семь", "собак", "нас двое", "нас трое", "нас четыр",
             "цена", "цену", "цены", "стоимост", "стоит", "почём", "почем", "сколько"]
 
+# Короткие ответы-согласия/выбор в идущем диалоге — чтобы продолжить бронь и подтянуть даты из истории
+CONTINUATION_SET = {"да", "давай", "давайте", "ага", "угу", "хорошо", "ок", "окей", "конечно",
+                    "посчитай", "посчитайте", "подойдет", "подойдёт", "подходит", "берем", "берём",
+                    "беру", "оформляй", "оформляйте", "вариант", "первый", "второй", "третий",
+                    "четвертый", "четвёртый", "это", "этот", "согласен", "согласна", "ладно", "годится"}
+
+def is_continuation(text):
+    """Короткий утвердительный/выбирающий ответ ('да', 'давай', 'вариант 2', '2'), чтобы
+    не оборвать бронь: тогда даты берём из истории и считаем цену по реальным данным."""
+    t = (text or "").strip().lower().strip("?.!,")
+    if not t:
+        return False
+    if t in {"1", "2", "3", "4", "5"}:   # выбор варианта одной цифрой
+        return True
+    words = re.findall(r'[а-яё]+', t)
+    return any(w in CONTINUATION_SET for w in words)
+
 FOTO_KEYWORDS = ["фото", "покажи", "фотки", "посмотреть", "как выглядит", "покажите",
                  "фотографии", "скинь", "скиньте", "пришли", "прислать", "загляни", "посмотри"]
 
@@ -1084,7 +1102,7 @@ def get_ai_response(user_message, chat_id):
     dates = extract_dates(user_message)
     # Гейт: наличие подтягиваем только если сообщение про даты/номера/бронь,
     # а не на "баня есть?" / "да" — иначе цепляем стейл-даты из истории.
-    intent = bool(dates) or detect_room_type(user_message) or (extract_adults(user_message) is not None) or any(kw in msg_low for kw in AVAIL_KW)
+    intent = bool(dates) or detect_room_type(user_message) or (extract_adults(user_message) is not None) or any(kw in msg_low for kw in AVAIL_KW) or is_continuation(user_message)
     if intent and not dates:
         # Берём самые свежие даты из диалога: от гостя (extract_dates) или из последнего предложения бота
         # (extract_last_range) — что встретится раньше при обходе с конца. Так согласие гостя после
@@ -1153,6 +1171,25 @@ def _wazzup_msg_id(resp):
     except Exception:
         return None
 
+_EMOJI_RE = re.compile("[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U00002B00-\U00002BFF]")
+_last_emoji = {}  # chat_id -> множество эмодзи последнего отправленного сообщения
+
+def dedup_emoji(chat_id, text):
+    """Не повторяем тот же эмодзи: помним последний использованный в чате и вырезаем его повтор,
+    пока не появится ДРУГОЙ эмодзи. Сообщения без эмодзи память не сбрасывают. Другой смайлик можно."""
+    if not text:
+        return text
+    prev = _last_emoji.get(chat_id) or set()
+    for e in set(_EMOJI_RE.findall(text)):
+        if e in prev:
+            text = text.replace(e, "")
+    text = re.sub(r'\s{2,}', ' ', text)
+    text = re.sub(r'\s+([,.:!?])', r'\1', text).strip()
+    now = set(_EMOJI_RE.findall(text))
+    if now:                       # обновляем память только когда в сообщении реально есть эмодзи
+        _last_emoji[chat_id] = now
+    return text
+
 def sanitize_outgoing(text):
     """Чистим текст перед отправкой в WhatsApp/MAX:
     - убираем тире (— и –) — живой человек их не печатает; дефис в датах 14-17 не трогаем
@@ -1176,6 +1213,9 @@ def sanitize_outgoing(text):
 
 def send_wazzup_message(chat_id, channel_id, text, chat_type="whatsapp"):
     text = sanitize_outgoing(text)
+    text = dedup_emoji(chat_id, text)
+    if not text or not text.strip():
+        return None
     remember_bot_sent(text)
     url = "https://api.wazzup24.com/v3/message"
     headers = {"Authorization": f"Bearer {WAZZUP_API_KEY}", "Content-Type": "application/json"}
@@ -1234,6 +1274,9 @@ def send_wazzup_multi(chat_id, channel_id, full_text, chat_type="whatsapp"):
 
 def send_max_message(chat_id, text):
     text = sanitize_outgoing(text)
+    text = dedup_emoji(chat_id, text)
+    if not text or not text.strip():
+        return
     remember_bot_sent(text)
     url = "https://botapi.max.ru/messages"
     params = {"access_token": MAX_TOKEN}
