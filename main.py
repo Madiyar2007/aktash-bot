@@ -7,6 +7,8 @@ import sqlite3
 import time
 import re
 import threading
+import json
+from urllib.parse import quote
 from datetime import datetime, timedelta, date
 from dotenv import load_dotenv
 import urllib3
@@ -596,14 +598,18 @@ def build_prefilled_link(date_from, date_to, rooms, phone=None):
     # на список). Пока не знаем формат для повторов — откатываемся на обычную ссылку (гость добавит сам).
     if any(v["c"] > 1 for v in groups.values()):
         return None
-    # roomTypes — JSON, кавычки кодируются как %22 (как в реальных ссылках модуля)
-    items = [f"%22{k}%22:{{%22c%22:{v['c']},%22bv%22:{v['bv']}}}" for k, v in groups.items()]
-    room_types = "{" + ",".join(items) + "}"
+    # roomTypes — JSON. Кодируем ЦЕЛИКОМ (фигурные скобки, кавычки, двоеточия, запятые), иначе на телефоне
+    # мессенджер обрезает ссылку на первом сыром символе { или | и тап не открывает страницу.
+    # Модуль url-декодирует параметр (раз %22 у него работает), поэтому на десктопе ничего не меняется.
+    rt_obj = {k: {"c": v["c"], "bv": v["bv"]} for k, v in groups.items()}
+    room_types = quote(json.dumps(rt_obj, separators=(",", ":")), safe="")
+    exval = quote(_MODULE_EXVAL, safe="")   # сырые | тоже ломают ссылку на мобильном
+    phone = _valid_prefill_phone(phone) or ""   # MAX chatId — не телефон, не подставляем
     return (f"https://reservationsteps.ru/bookings/index/{BOOKING_MODULE_ID}"
             f"?&dfrom={df}&dto={dt}&lang=ru&servicemode=0&adults={total}"
-            f"&colorSchemePreview=0&firstroom=0&onlyrooms=&name=&surname=&email=&phone={phone or ''}"
+            f"&colorSchemePreview=0&firstroom=0&onlyrooms=&name=&surname=&email=&phone={phone}"
             f"&orderid=&roomTypes={room_types}&planId={MODULE_PLAN_ID}"
-            f"&is_auto_search=0&vkapp=0&insidePopup=0&exval={_MODULE_EXVAL}&mobile_id=0")
+            f"&is_auto_search=0&vkapp=0&insidePopup=0&exval={exval}&mobile_id=0")
 
 def build_booking_link(date_from, date_to, adults=2, phone=None, children=None):
     """Ссылка на модуль бронирования с предзаполненными датами и гостями.
@@ -621,6 +627,7 @@ def build_booking_link(date_from, date_to, adults=2, phone=None, children=None):
     if children:  # дети: children=[4,6] в URL-кодировке -> %5B4%2C6%5D
         ages = ",".join(str(int(a)) for a in children)
         url += f"&children=%5B{ages.replace(',', '%2C')}%5D"
+    phone = _valid_prefill_phone(phone)  # MAX chatId — не телефон, не подставляем
     if phone:  # предзаполняем телефон гостя — так бронь сматчится с его WhatsApp
         url += f"&phone={phone}"
     return url
@@ -652,6 +659,18 @@ def phone_to_chat_id(phone):
     elif len(digits) == 10:
         digits = '7' + digits
     return digits if len(digits) == 11 else None
+
+def _valid_prefill_phone(value):
+    """Подставлять телефон в форму брони можно ТОЛЬКО если он похож на реальный номер.
+    В WhatsApp chatId = телефон (11 цифр, 7…) — годится. В MAX chatId — внутренний id мессенджера
+    (например 124503453), НЕ телефон: модуль примет его за номер и нарисует мусор (+1 245 034-53).
+    Возвращает нормализованный телефон или None (тогда поле оставляем пустым, гость впишет сам)."""
+    digits = re.sub(r'\D', '', str(value or ''))
+    if len(digits) == 11 and digits[0] == '8':
+        digits = '7' + digits[1:]
+    if len(digits) == 11 and digits[0] == '7':
+        return digits
+    return None
 
 def booking_already_confirmed(booking_id):
     """Атомарно: True если этой брони уже слали подтверждение оплаты."""
