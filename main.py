@@ -1546,14 +1546,18 @@ def sanitize_outgoing(text):
 _notified_handoff = {}            # chat_id -> ts: антиспам уведомлений Асели (не чаще раза в 10 мин на чат)
 _notify_lock = threading.Lock()
 
-def notify_asel(text):
-    """Шлём Асели уведомление в Telegram. Тихо ничего не делаем, если Telegram не настроен (нет env)."""
+def notify_asel(text, button=None):
+    """Шлём Асели уведомление в Telegram. Тихо ничего не делаем, если Telegram не настроен (нет env).
+    button — опциональная инлайн-кнопка {'text':..., 'url':...} («Открыть чат»)."""
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         sys.stderr.write("notify_asel: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не заданы — уведомление пропущено\n"); sys.stderr.flush()
         return
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+    if button and button.get("url"):
+        payload["reply_markup"] = {"inline_keyboard": [[{"text": button["text"], "url": button["url"]}]]}
     try:
         r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                          json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10)
+                          json=payload, timeout=10)
         sys.stderr.write(f"notify_asel: status={r.status_code} body={r.text[:150]}\n"); sys.stderr.flush()
     except Exception as e:
         sys.stderr.write(f"notify_asel error: {e}\n"); sys.stderr.flush()
@@ -1571,12 +1575,21 @@ def maybe_notify_handoff(chat_id, chat_type, guest_name, guest_phone, guest_msg,
         for k in [k for k, ts in _notified_handoff.items() if now - ts > 3600]:
             _notified_handoff.pop(k, None)
     phone_line = f"+{guest_phone}" if guest_phone else "не передан (только чат)"
+    # Кнопка «Открыть чат» только для WhatsApp: там есть публичная ссылка wa.me/<номер>.
+    # У MAX публичной ссылки на чат нет — Асель ищет по имени или звонит.
+    button = None
+    if chat_type == "whatsapp" and guest_phone:
+        button = {"text": "💬 Открыть чат", "url": f"https://wa.me/{guest_phone}"}
+        find_hint = "Нажмите «Открыть чат» или перезвоните гостю."
+    else:
+        find_hint = "Найдите чат по имени в приложении или перезвоните гостю."
     notify_asel(
         "🔔 Гость ждёт ответа администратора\n"
         f"Имя в {chat_type}: {guest_name or 'не указано'}\n"
         f"Телефон: {phone_line}\n"
         f"Спросил: {(guest_msg or '')[:200]}\n"
-        "Найдите чат по имени в приложении или перезвоните гостю."
+        + find_hint,
+        button=button
     )
 
 def send_wazzup_message(chat_id, channel_id, text, chat_type="whatsapp"):
@@ -1719,6 +1732,7 @@ def flush_chat(chat_id):
         photo_descs = []
         room_from_photo = None
         quoted_text = None
+        quoted_unresolved = False
         has_audio = False
         has_image = False
         for msg in msgs:
@@ -1750,9 +1764,14 @@ def flush_chat(chat_id):
                 if t:
                     texts.append(t)
                 q = msg.get("quotedMessage") or {}
-                qt = get_msg_text(q.get("messageId")) if q else None
-                if qt:
-                    quoted_text = qt
+                if q:
+                    # 1) текст из нашей базы по messageId; 2) текст прямо из вебхука (если мессенджер его кладёт) —
+                    # так резолвятся даже старые сообщения и сообщения, отправленные до внедрения бота
+                    qt = get_msg_text(q.get("messageId")) or q.get("text") or (q.get("message") or {}).get("text")
+                    if qt:
+                        quoted_text = qt
+                    else:
+                        quoted_unresolved = True  # цитата есть, но текст недоступен — попросим уточнить
 
         combined = " ".join(texts).strip()
 
@@ -1782,12 +1801,19 @@ def flush_chat(chat_id):
         if photo_descs:
             ai_input = f"[Гость прислал фото, на нём: {'; '.join(photo_descs)}] {ai_input}".strip()
         if quoted_text:
-            ai_input = f"(гость отвечает на ваше сообщение: «{quoted_text}») {ai_input}".strip()
+            ai_input = f"(гость пишет в ответ на сообщение: «{quoted_text}») {ai_input}".strip()
+        elif quoted_unresolved:
+            ai_input = ("(гость ответил цитатой на старое сообщение, его текст недоступен — "
+                        "если из его слов непонятно, о чём речь, мягко уточни, а не угадывай) " + ai_input).strip()
 
         ai_reply = get_ai_response(ai_input, chat_id)
         save_user = combined if combined else f"[фото: {'; '.join(photo_descs)[:100]}]"
         save_message(chat_id, "user", save_user)
         save_message(chat_id, "assistant", ai_reply)
+        # Запоминаем тексты входящих гостя по их messageId — чтобы он мог потом ответить reply на своё же сообщение
+        for m in msgs:
+            if m.get("type", "text") == "text" and m.get("text") and m.get("messageId"):
+                remember_msg_text(m["messageId"], m["text"])
         send_wazzup_multi(chat_id, channel_id, ai_reply, chat_type)
         # Бот направил гостя к Асели? Пингуем её в Telegram с телефоном гостя
         guest_name = next((m.get("contact", {}).get("name") for m in msgs
