@@ -224,6 +224,11 @@ def init_db():
     # Навсегда отключённые чаты (личные контакты/друзья) — бот туда не пишет никогда
     c.execute('''CREATE TABLE IF NOT EXISTS disabled_chats
                  (chat_id TEXT PRIMARY KEY, ts REAL)''')
+    # Маршрут гостя: на каком канале и в каком мессенджере он писал + его телефон.
+    # Нужно, чтобы проактивное «Оплата получена» уходило туда же, где гость общался (WhatsApp ИЛИ MAX).
+    c.execute('''CREATE TABLE IF NOT EXISTS chat_routes
+                 (chat_id TEXT PRIMARY KEY, channel_id TEXT, chat_type TEXT, phone TEXT, ts REAL)''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_chat_routes_phone ON chat_routes(phone)')
     conn.commit()
     conn.close()
 
@@ -672,6 +677,51 @@ def _valid_prefill_phone(value):
         return digits
     return None
 
+def _norm_phone(value):
+    """Любой телефон -> 11 цифр в формате 7XXXXXXXXXX или None. Для матчинга брони с чатом гостя."""
+    return _valid_prefill_phone(value)
+
+def _guest_phone_from_msg(msg):
+    """Телефон гостя из входящего сообщения: из contact.phone, либо (для WhatsApp) сам chatId = телефон."""
+    c = msg.get("contact") or {}
+    ph = c.get("phone") or c.get("phoneNumber") or c.get("phone_number")
+    if not ph and (msg.get("chatType") or "whatsapp") == "whatsapp":
+        ph = msg.get("chatId")
+    return _norm_phone(ph)
+
+def save_chat_route(chat_id, channel_id, chat_type, phone=None):
+    """Запоминаем, где общался гость (канал, мессенджер) и его телефон. Телефон не затираем None-ом."""
+    if not chat_id:
+        return
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    c = conn.cursor()
+    try:
+        row = c.execute("SELECT phone FROM chat_routes WHERE chat_id=?", (chat_id,)).fetchone()
+        phone = phone or (row[0] if row else None)   # не теряем ранее сохранённый телефон
+        c.execute("""INSERT INTO chat_routes (chat_id, channel_id, chat_type, phone, ts)
+                     VALUES (?,?,?,?,?)
+                     ON CONFLICT(chat_id) DO UPDATE SET
+                       channel_id=excluded.channel_id, chat_type=excluded.chat_type,
+                       phone=excluded.phone, ts=excluded.ts""",
+                  (chat_id, channel_id or "", chat_type or "whatsapp", phone, time.time()))
+        conn.commit()
+    finally:
+        conn.close()
+
+def find_chat_by_phone(phone):
+    """По телефону из брони -> (chat_id, channel_id, chat_type) самого свежего чата гостя. None если нет."""
+    norm = _norm_phone(phone)
+    if not norm:
+        return None
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    c = conn.cursor()
+    try:
+        row = c.execute("""SELECT chat_id, channel_id, chat_type FROM chat_routes
+                           WHERE phone=? ORDER BY ts DESC LIMIT 1""", (norm,)).fetchone()
+        return (row[0], row[1], row[2]) if row else None
+    finally:
+        conn.close()
+
 def booking_already_confirmed(booking_id):
     """Атомарно: True если этой брони уже слали подтверждение оплаты."""
     conn = sqlite3.connect(DB_PATH, timeout=10)
@@ -698,19 +748,28 @@ def process_bnovo_booking(booking_id):
         if paid <= 0:
             return  # оплаты ещё нет — ждём следующего вебхука
         customer = booking.get('customer') or {}
-        chat_id = phone_to_chat_id(customer.get('phone'))
-        if not chat_id:
-            return
-        # Пишем только тем, кто реально общался с ботом (не чужие брони из Booking.com и т.п.)
-        if not get_history(chat_id):
-            sys.stderr.write(f"BNOVO booking {booking_id}: chat {chat_id} не наш — пропуск\n"); sys.stderr.flush()
-            return
+        phone = customer.get('phone')
+        confirm_text = "Оплата получена ✅ ||| Бронь подтверждена ||| Ждём вас, заезд с 14:00 🏔"
+        # Куда слать: сначала по маршруту гостя (туда, где он общался — WhatsApp ИЛИ MAX),
+        # иначе фоллбэк на WhatsApp по телефону = chatId. Определяем цель НЕ помечая бронь.
+        route = find_chat_by_phone(phone)
+        if route and get_history(route[0]):
+            target = (route[0], route[1] or WAZZUP_CHANNEL_ID, route[2] or "whatsapp")
+        else:
+            chat_id = phone_to_chat_id(phone)
+            # Пишем только тем, кто реально общался с ботом (не чужие брони из Booking.com и т.п.)
+            if not chat_id or not get_history(chat_id):
+                sys.stderr.write(f"BNOVO booking {booking_id}: чат гостя не найден — пропуск\n"); sys.stderr.flush()
+                return
+            target = (chat_id, WAZZUP_CHANNEL_ID, "whatsapp")
+        # Пометку «подтверждено» ставим АТОМАРНО строго перед отправкой — иначе при отсутствии чата
+        # бронь бы помечалась зря и подтверждение никогда не ушло бы при повторном вебхуке.
         if booking_already_confirmed(booking_id):
             return  # уже подтверждали
-        send_wazzup_multi(chat_id, WAZZUP_CHANNEL_ID,
-                          "Оплата получена ✅ ||| Бронь подтверждена ||| Ждём вас, заезд с 14:00 🏔")
-        save_message(chat_id, "assistant", "Оплата получена, бронь подтверждена")
-        sys.stderr.write(f"BNOVO booking {booking_id} подтверждена гостю {chat_id}\n"); sys.stderr.flush()
+        rc_id, rc_channel, rc_type = target
+        send_wazzup_multi(rc_id, rc_channel, confirm_text, rc_type)
+        save_message(rc_id, "assistant", "Оплата получена, бронь подтверждена")
+        sys.stderr.write(f"BNOVO booking {booking_id} подтверждена гостю {rc_id} ({rc_type})\n"); sys.stderr.flush()
     except Exception as e:
         sys.stderr.write(f"process_bnovo_booking error: {e}\n"); sys.stderr.flush()
 
@@ -1403,9 +1462,13 @@ def get_ai_response(user_message, chat_id):
         if link:
             reply = re.sub(r'\[BOOKING_LINK(?:\s+rooms=[^\]]*)?\]', lambda _: link, reply)
         else:
-            # ссылку не собрать — убираем строки с токеном, не роняя всё сообщение
-            reply = "\n".join(ln for ln in re.split(r'\s*\|\|\|\s*|\n', reply)
-                              if ln.strip() and "[BOOKING_LINK" not in ln).strip()
+            # Ссылку не собрать (чаще всего нет дат — например после сброса истории). Не оставляем
+            # пустого обещания «вот ссылка»: выкидываем токен и сегменты-обещания про ссылку/оплату.
+            segs = [ln.strip() for ln in re.split(r'\s*\|\|\|\s*|\n', reply)
+                    if ln.strip() and "[BOOKING_LINK" not in ln]
+            kept = [s for s in segs if not re.search(r'ссылк|оплат', s.lower())]
+            reply = "\n".join(kept).strip() if kept else \
+                "Уточните, пожалуйста, даты заезда и выезда, пришлю ссылку на бронирование"
     return reply
 
 ROOM_LABELS = {
@@ -1559,13 +1622,16 @@ def enqueue_message(msg):
         entry = _pending.get(chat_id)
         if entry is None:
             entry = {"msgs": [], "channel_id": msg.get("channelId", ""),
-                     "chat_type": msg.get("chatType", "whatsapp"), "timer": None}
+                     "chat_type": msg.get("chatType", "whatsapp"), "phone": None, "timer": None}
             _pending[chat_id] = entry
         entry["msgs"].append(msg)
         if msg.get("channelId"):
             entry["channel_id"] = msg.get("channelId")
         if msg.get("chatType"):
             entry["chat_type"] = msg.get("chatType")
+        ph = _guest_phone_from_msg(msg)
+        if ph:
+            entry["phone"] = ph
         if entry["timer"]:
             entry["timer"].cancel()
         t = threading.Timer(DEBOUNCE_SECONDS, flush_chat, args=(chat_id,))
@@ -1582,6 +1648,8 @@ def flush_chat(chat_id):
     msgs = entry["msgs"]
     channel_id = entry["channel_id"]
     chat_type = entry.get("chat_type", "whatsapp")
+    # Запоминаем маршрут гостя (канал/мессенджер/телефон), чтобы подтверждение оплаты ушло туда же
+    save_chat_route(chat_id, channel_id, chat_type, entry.get("phone"))
     # Ручной режим: бот на паузе (Асель ведёт диалог) или чат в стоп-листе — не отвечаем,
     # но сохраняем текст гостя в историю, чтобы при возврате бот видел контекст.
     if is_bot_paused(chat_id):
@@ -1781,6 +1849,26 @@ def admin_bot():
         return {"chat_id": chat_id, "paused": False}
     return {"chat_id": chat_id, "paused": is_bot_paused(chat_id), "disabled": is_bot_disabled(chat_id)}
 
+def ensure_wazzup_webhook():
+    """На старте проставляем адрес вебхука Wazzup новым ключом. После ротации ключа подписка слетает —
+    так редеплой сам её восстанавливает, без ручного curl. Идемпотентно (PATCH перезапишет то же значение)."""
+    if not WAZZUP_API_KEY:
+        return
+    base = (os.getenv("WEBHOOK_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL")
+            or "https://aktash-bot.onrender.com").rstrip("/")
+    uri = base + "/webhook"
+    try:
+        r = requests.patch(
+            "https://api.wazzup24.com/v3/webhooks",
+            headers={"Authorization": f"Bearer {WAZZUP_API_KEY}", "Content-Type": "application/json"},
+            json={"webhooksUri": uri, "subscriptions": {"messagesAndStatuses": True}},
+            timeout=15)
+        sys.stderr.write(f"Webhook autoregister: status={r.status_code} uri={uri} body={r.text[:150]}\n")
+        sys.stderr.flush()
+    except Exception as e:
+        sys.stderr.write(f"Webhook autoregister error: {e}\n"); sys.stderr.flush()
+
 if __name__ == "__main__":
+    ensure_wazzup_webhook()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, threaded=True)
