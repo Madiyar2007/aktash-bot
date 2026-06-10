@@ -1472,6 +1472,9 @@ def send_wazzup_message(chat_id, channel_id, text, chat_type="whatsapp"):
     payload = {"channelId": channel_id, "chatId": chat_id, "chatType": chat_type, "text": text}
     try:
         r = requests.post(url, json=payload, headers=headers, timeout=15)
+        if r.status_code not in (200, 201):
+            # Невалидный/просроченный ключ или неверный channelId — иначе отправка падает молча
+            sys.stderr.write(f"Wazzup send FAILED status={r.status_code} body={r.text[:200]}\n"); sys.stderr.flush()
         mid = _wazzup_msg_id(r)
         if mid:
             remember_msg_text(mid, text)
