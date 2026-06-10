@@ -1850,10 +1850,11 @@ def admin_bot():
     return {"chat_id": chat_id, "paused": is_bot_paused(chat_id), "disabled": is_bot_disabled(chat_id)}
 
 def ensure_wazzup_webhook():
-    """На старте проставляем адрес вебхука Wazzup новым ключом. После ротации ключа подписка слетает —
-    так редеплой сам её восстанавливает, без ручного curl. Идемпотентно (PATCH перезапишет то же значение)."""
+    """Проставляем адрес вебхука Wazzup текущим ключом. Возвращает HTTP-статус или None.
+    ВАЖНО: Wazzup при установке делает тестовый запрос на сам URL и ждёт ответа, поэтому вызывать
+    это нужно, когда сервер уже поднят и доступен снаружи (см. фоновый ретрай ниже)."""
     if not WAZZUP_API_KEY:
-        return
+        return None
     base = (os.getenv("WEBHOOK_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL")
             or "https://aktash-bot.onrender.com").rstrip("/")
     uri = base + "/webhook"
@@ -1865,10 +1866,20 @@ def ensure_wazzup_webhook():
             timeout=15)
         sys.stderr.write(f"Webhook autoregister: status={r.status_code} uri={uri} body={r.text[:150]}\n")
         sys.stderr.flush()
+        return r.status_code
     except Exception as e:
         sys.stderr.write(f"Webhook autoregister error: {e}\n"); sys.stderr.flush()
+        return None
+
+def _webhook_autoregister_loop():
+    """На старте сервис ещё не 'live' во внешней сети Render, и тестовый запрос Wazzup на URL падает
+    (400 WEBHOOKS_REQUEST_NOT_VALID). Поэтому ретраим с задержками, пока не получим 200."""
+    for delay in (15, 20, 40, 60, 120):
+        time.sleep(delay)
+        if ensure_wazzup_webhook() == 200:
+            return
 
 if __name__ == "__main__":
-    ensure_wazzup_webhook()
+    threading.Thread(target=_webhook_autoregister_loop, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, threaded=True)
